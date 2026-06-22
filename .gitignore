@@ -1,0 +1,6 @@
+
+# Xcode build output
+Build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
