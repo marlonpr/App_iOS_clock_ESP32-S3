@@ -37,7 +37,8 @@ private struct ConnectionCallbackContext: @unchecked Sendable {
 final class ESP32TCPClient {
     typealias StateHandler = (TCPConnectionState) -> Void
     typealias FrameHandler = ([UInt8]) -> Void
-    typealias ConnectionFactory = (IPv4Address, NWEndpoint.Port) -> TCPConnection
+    typealias HostConnectionFactory = (IPv4Address, NWEndpoint.Port) -> TCPConnection
+    typealias EndpointConnectionFactory = (NWEndpoint) -> TCPConnection
 
     static let defaultPort: UInt16 = 5000
     static let frameDelimiter: UInt8 = 0x5C
@@ -46,15 +47,22 @@ final class ESP32TCPClient {
     var onFrameReceived: FrameHandler?
 
     private let queue = DispatchQueue(label: "ESP32Controller.TCPClient")
-    private let connectionFactory: ConnectionFactory
+    private let hostConnectionFactory: HostConnectionFactory
+    private let endpointConnectionFactory: EndpointConnectionFactory
     private var connection: TCPConnection?
     private var activeConnectionID: UUID?
     private var receiveBuffer: [UInt8] = []
 
-    init(connectionFactory: @escaping ConnectionFactory = { address, port in
-        NWConnection(host: .ipv4(address), port: port, using: .tcp)
-    }) {
-        self.connectionFactory = connectionFactory
+    init(
+        connectionFactory: @escaping HostConnectionFactory = { address, port in
+            NWConnection(host: .ipv4(address), port: port, using: .tcp)
+        },
+        endpointConnectionFactory: @escaping EndpointConnectionFactory = { endpoint in
+            NWConnection(to: endpoint, using: .tcp)
+        }
+    ) {
+        self.hostConnectionFactory = connectionFactory
+        self.endpointConnectionFactory = endpointConnectionFactory
     }
 
     func connect(host: String, port: UInt16) {
@@ -70,8 +78,16 @@ final class ESP32TCPClient {
             return
         }
 
+        startConnection(hostConnectionFactory(address, nwPort))
+    }
+
+    func connect(to endpoint: NWEndpoint) {
+        disconnect()
+        startConnection(endpointConnectionFactory(endpoint))
+    }
+
+    private func startConnection(_ connection: TCPConnection) {
         let connectionID = UUID()
-        let connection = connectionFactory(address, nwPort)
         self.connection = connection
         activeConnectionID = connectionID
         receiveBuffer.removeAll(keepingCapacity: true)

@@ -6,18 +6,36 @@
 //
 
 import Foundation
+import Combine
+import Network
 
 @MainActor
 final class ESP32ControllerViewModel: ObservableObject {
     @Published var host = "192.168.4.1"
     @Published var port = String(ESP32TCPClient.defaultPort)
     @Published private(set) var state: TCPConnectionState = .disconnected
+    @Published private(set) var discoveryState: ESP32DiscoveryState = .stopped
+    @Published private(set) var scannerState: ESP32ScannerState = .idle
+    @Published private(set) var discoveredDevices: [DiscoveredESP32] = []
+    @Published private(set) var discoveryErrorText: String?
+    @Published private(set) var isRefreshingDevices = false
+    @Published private(set) var connectedEndpointDescription: String?
+    @Published private(set) var connectedDiscoveredDevice: DiscoveredESP32?
+    @Published private(set) var pendingSelectedEndpointDescription: String?
+    @Published private(set) var scannerConnectionErrorText: String?
+    @Published var isScannerPresented = false
     @Published private(set) var logEntries: [CommunicationLogEntry] = []
     @Published var outgoingHex = ""
     @Published var appendFrameDelimiter = true
 
     private let client: ESP32TCPClient
+    private let discoveryService: ESP32DiscoveryService
     private let maxLogEntries = 200
+    private var pendingConnectionEndpointDescription: String?
+    private var pendingConnectionDevice: DiscoveredESP32?
+    private var connectionAttempt: ConnectionAttempt = .idle
+    private var isExpectingInitialDisconnect = false
+    private var cancellables: Set<AnyCancellable> = []
 
     var canConnect: Bool {
         switch state {
@@ -41,11 +59,14 @@ final class ESP32ControllerViewModel: ObservableObject {
         state == .connected
     }
 
-    init(client: ESP32TCPClient? = nil) {
+    init(client: ESP32TCPClient? = nil, discoveryService: ESP32DiscoveryService? = nil) {
         self.client = client ?? ESP32TCPClient()
+        self.discoveryService = discoveryService ?? ESP32DiscoveryService()
 
         self.client.onStateChange = { [weak self] state in
             DispatchQueue.main.async {
+                self?.handleConnectionStateChange(state)
+
                 self?.state = state
                 self?.appendEvent(state.title)
             }
@@ -56,6 +77,73 @@ final class ESP32ControllerViewModel: ObservableObject {
                 self?.appendLog(direction: .incoming, bytes: bytes)
             }
         }
+
+        self.discoveryService.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                self?.discoveryState = state
+            }
+            .store(in: &cancellables)
+
+        self.discoveryService.$scannerState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                self?.scannerState = state
+            }
+            .store(in: &cancellables)
+
+        self.discoveryService.$devices
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] devices in
+                self?.discoveredDevices = devices
+            }
+            .store(in: &cancellables)
+
+        self.discoveryService.$errorText
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] errorText in
+                self?.discoveryErrorText = errorText
+            }
+            .store(in: &cancellables)
+
+        self.discoveryService.$isRefreshing
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isRefreshing in
+                self?.isRefreshingDevices = isRefreshing
+            }
+            .store(in: &cancellables)
+    }
+
+    func startDiscovery() {
+        beginDeviceScan()
+    }
+
+    func stopDiscovery() {
+        discoveryService.stopDiscovery()
+    }
+
+    func refreshDiscovery() {
+        refreshDevices()
+    }
+
+    func refreshDevices() {
+        beginDeviceScan()
+    }
+
+    func presentDeviceScanner() {
+        isScannerPresented = true
+    }
+
+    func beginDeviceScan() {
+        pendingSelectedEndpointDescription = nil
+        scannerConnectionErrorText = nil
+        discoveryService.beginDeviceScan(connectedEndpointDescription: connectedEndpointDescription)
+    }
+
+    func closeDeviceScanner() {
+        isScannerPresented = false
+        pendingSelectedEndpointDescription = nil
+        discoveryService.stopScan()
     }
 
     func connect() {
@@ -65,10 +153,43 @@ final class ESP32ControllerViewModel: ObservableObject {
             return
         }
 
+        beginConnectionAttempt(.manual)
         client.connect(host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: parsedPort)
     }
 
+    func connect(to device: DiscoveredESP32) {
+        guard canSelectScannedDevice(device) else {
+            return
+        }
+
+        pendingSelectedEndpointDescription = device.stableEndpointDescription
+        pendingConnectionDevice = device
+        scannerConnectionErrorText = nil
+        beginConnectionAttempt(.discovered(device.stableEndpointDescription))
+        client.connect(to: device.endpoint)
+    }
+
+    func canSelectScannedDevice(_ device: DiscoveredESP32) -> Bool {
+        if case .connecting = state {
+            return false
+        }
+
+        if pendingSelectedEndpointDescription != nil {
+            return false
+        }
+
+        return connectedEndpointDescription != device.stableEndpointDescription
+    }
+
     func disconnect() {
+        connectionAttempt = .explicitDisconnect
+        isExpectingInitialDisconnect = false
+        pendingConnectionEndpointDescription = nil
+        pendingConnectionDevice = nil
+        pendingSelectedEndpointDescription = nil
+        connectedEndpointDescription = nil
+        connectedDiscoveredDevice = nil
+        discoveryService.updateConnectedEndpointDescription(nil)
         client.disconnect()
     }
 
@@ -100,6 +221,85 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     private func appendEvent(_ message: String) {
         appendLog(direction: .event, bytes: [], message: message)
+    }
+
+    private func beginConnectionAttempt(_ target: ConnectionTarget) {
+        connectionAttempt = .starting(target)
+        isExpectingInitialDisconnect = true
+        connectedEndpointDescription = nil
+        connectedDiscoveredDevice = nil
+        discoveryService.updateConnectedEndpointDescription(nil)
+
+        switch target {
+        case .manual:
+            pendingConnectionEndpointDescription = nil
+            pendingConnectionDevice = nil
+            pendingSelectedEndpointDescription = nil
+            scannerConnectionErrorText = nil
+        case let .discovered(endpointDescription):
+            pendingConnectionEndpointDescription = endpointDescription
+        }
+    }
+
+    private func handleConnectionStateChange(_ newState: TCPConnectionState) {
+        switch newState {
+        case .connecting:
+            if case let .starting(target) = connectionAttempt {
+                connectionAttempt = .connecting(target)
+            }
+        case .connected:
+            switch connectionAttempt {
+            case let .starting(target), let .connecting(target):
+                completeConnection(to: target)
+            case .idle, .connected, .explicitDisconnect:
+                break
+            }
+        case .failed:
+            isExpectingInitialDisconnect = false
+            connectionAttempt = .idle
+            pendingConnectionEndpointDescription = nil
+            pendingConnectionDevice = nil
+            pendingSelectedEndpointDescription = nil
+            scannerConnectionErrorText = newState.detail ?? newState.title
+            connectedEndpointDescription = nil
+            connectedDiscoveredDevice = nil
+            discoveryService.updateConnectedEndpointDescription(nil)
+        case .disconnected:
+            if isExpectingInitialDisconnect {
+                isExpectingInitialDisconnect = false
+                return
+            }
+
+            connectionAttempt = .idle
+            pendingConnectionEndpointDescription = nil
+            pendingConnectionDevice = nil
+            pendingSelectedEndpointDescription = nil
+            connectedEndpointDescription = nil
+            connectedDiscoveredDevice = nil
+            discoveryService.updateConnectedEndpointDescription(nil)
+        }
+    }
+
+    private func completeConnection(to target: ConnectionTarget) {
+        isExpectingInitialDisconnect = false
+        pendingConnectionEndpointDescription = nil
+
+        switch target {
+        case .manual:
+            connectedEndpointDescription = nil
+            connectedDiscoveredDevice = nil
+        case let .discovered(endpointDescription):
+            connectedEndpointDescription = endpointDescription
+            connectedDiscoveredDevice = pendingConnectionDevice
+            isScannerPresented = false
+            discoveryService.stopScan()
+        }
+
+        pendingSelectedEndpointDescription = nil
+        pendingConnectionDevice = nil
+        scannerConnectionErrorText = nil
+        discoveryService.updateConnectedEndpointDescription(connectedEndpointDescription)
+        connectionAttempt = .connected(target)
     }
 
     private func appendLog(
@@ -144,6 +344,19 @@ final class ESP32ControllerViewModel: ObservableObject {
             return byte
         }
     }
+}
+
+private enum ConnectionTarget: Equatable {
+    case manual
+    case discovered(String)
+}
+
+private enum ConnectionAttempt: Equatable {
+    case idle
+    case starting(ConnectionTarget)
+    case connecting(ConnectionTarget)
+    case connected(ConnectionTarget)
+    case explicitDisconnect
 }
 
 enum HexInputError: LocalizedError {
