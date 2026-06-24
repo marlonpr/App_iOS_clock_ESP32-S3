@@ -13,6 +13,7 @@ import Network
 final class ESP32ControllerViewModel: ObservableObject {
     @Published var host = "192.168.4.1"
     @Published var port = String(ESP32TCPClient.defaultPort)
+    @Published var manualBoardID = ""
     @Published private(set) var state: TCPConnectionState = .disconnected
     @Published private(set) var discoveryState: ESP32DiscoveryState = .stopped
     @Published private(set) var scannerState: ESP32ScannerState = .idle
@@ -23,10 +24,13 @@ final class ESP32ControllerViewModel: ObservableObject {
     @Published private(set) var connectedDiscoveredDevice: DiscoveredESP32?
     @Published private(set) var pendingSelectedEndpointDescription: String?
     @Published private(set) var scannerConnectionErrorText: String?
+    @Published private(set) var connectionHealth: ConnectionHealthState = .idle
     @Published var isScannerPresented = false
     @Published private(set) var logEntries: [CommunicationLogEntry] = []
     @Published var outgoingHex = ""
     @Published var appendFrameDelimiter = true
+
+    static let reservedBoardIDMessage = "Board ID 92 is reserved because it equals the protocol frame delimiter 0x5C."
 
     private let client: ESP32TCPClient
     private let discoveryService: ESP32DiscoveryService
@@ -59,6 +63,43 @@ final class ESP32ControllerViewModel: ObservableObject {
         state == .connected
     }
 
+    var connectionStatusText: String {
+        switch state {
+        case .connected:
+            switch connectionHealth {
+            case .idle, .healthy:
+                return "Connected"
+            case .waitingForACK:
+                return "Connected"
+            case let .degraded(missedCount):
+                return "Connected · Unstable (\(missedCount)/\(ESP32TCPClient.defaultHeartbeatConfiguration.maximumConsecutiveMisses) missed)"
+            case .timedOut:
+                return "Connection lost"
+            }
+        case .disconnected:
+            return connectionHealth == .timedOut ? "Connection lost" : state.title
+        case .failed:
+            return state.detail == "Heartbeat timed out" ? "Connection lost" : state.title
+        case .connecting:
+            return state.title
+        }
+    }
+
+    var connectionHealthAccessibilityValue: String {
+        switch connectionHealth {
+        case .idle:
+            return "Heartbeat unavailable"
+        case .healthy:
+            return "Heartbeat healthy"
+        case .waitingForACK:
+            return "Heartbeat awaiting acknowledgement"
+        case let .degraded(missedCount):
+            return "Heartbeat unstable, \(missedCount) of \(ESP32TCPClient.defaultHeartbeatConfiguration.maximumConsecutiveMisses) missed"
+        case .timedOut:
+            return "Heartbeat timed out"
+        }
+    }
+
     init(client: ESP32TCPClient? = nil, discoveryService: ESP32DiscoveryService? = nil) {
         self.client = client ?? ESP32TCPClient()
         self.discoveryService = discoveryService ?? ESP32DiscoveryService()
@@ -75,6 +116,12 @@ final class ESP32ControllerViewModel: ObservableObject {
         self.client.onFrameReceived = { [weak self] bytes in
             DispatchQueue.main.async {
                 self?.appendLog(direction: .incoming, bytes: bytes)
+            }
+        }
+
+        self.client.onConnectionHealthChange = { [weak self] health in
+            DispatchQueue.main.async {
+                self?.connectionHealth = health
             }
         }
 
@@ -153,8 +200,22 @@ final class ESP32ControllerViewModel: ObservableObject {
             return
         }
 
+        let parsedBoardID: UInt8?
+        switch Self.manualBoardIDByte(from: manualBoardID) {
+        case let .valid(boardID):
+            parsedBoardID = boardID
+        case let .invalid(message):
+            state = .failed(message)
+            appendEvent("Invalid board ID")
+            return
+        }
+
         beginConnectionAttempt(.manual)
-        client.connect(host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: parsedPort)
+        client.connect(
+            host: host.trimmingCharacters(in: .whitespacesAndNewlines),
+            port: parsedPort,
+            boardID: parsedBoardID
+        )
     }
 
     func connect(to device: DiscoveredESP32) {
@@ -166,7 +227,13 @@ final class ESP32ControllerViewModel: ObservableObject {
         pendingConnectionDevice = device
         scannerConnectionErrorText = nil
         beginConnectionAttempt(.discovered(device.stableEndpointDescription))
-        client.connect(to: device.endpoint)
+
+        let boardID = Self.boardIDByte(from: device.boardID)
+        if boardID == nil, Self.isReservedBoardIDText(device.boardID) {
+            appendEvent("Heartbeat unavailable: \(Self.reservedBoardIDMessage)")
+        }
+
+        client.connect(to: device.endpoint, boardID: boardID)
     }
 
     func canSelectScannedDevice(_ device: DiscoveredESP32) -> Bool {
@@ -344,6 +411,58 @@ final class ESP32ControllerViewModel: ObservableObject {
             return byte
         }
     }
+
+    static func boardIDByte(from boardID: String?) -> UInt8? {
+        guard let boardID else {
+            return nil
+        }
+
+        let trimmed = boardID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.allSatisfy(\.isNumber) else {
+            return nil
+        }
+
+        guard let byte = UInt8(trimmed, radix: 10), byte != ESP32TCPClient.reservedBoardID else {
+            return nil
+        }
+
+        return byte
+    }
+
+    static func manualBoardIDByte(from boardID: String) -> ManualBoardIDParseResult {
+        let trimmed = boardID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return .valid(nil)
+        }
+
+        guard let byte = boardIDByte(from: trimmed) else {
+            if isReservedBoardIDText(trimmed) {
+                return .invalid(reservedBoardIDMessage)
+            }
+
+            return .invalid("Board ID must be a decimal value from 0 through 255")
+        }
+
+        return .valid(byte)
+    }
+
+    private static func isReservedBoardIDText(_ boardID: String?) -> Bool {
+        guard let boardID else {
+            return false
+        }
+
+        let trimmed = boardID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.allSatisfy(\.isNumber) else {
+            return false
+        }
+
+        return UInt8(trimmed, radix: 10) == ESP32TCPClient.reservedBoardID
+    }
+}
+
+enum ManualBoardIDParseResult: Equatable {
+    case valid(UInt8?)
+    case invalid(String)
 }
 
 private enum ConnectionTarget: Equatable {

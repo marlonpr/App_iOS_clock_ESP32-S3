@@ -19,7 +19,11 @@ struct ContentView: View {
                     }
 
                     if let connectedDevice = viewModel.connectedDiscoveredDevice {
-                        ConnectedDeviceSummary(device: connectedDevice)
+                        ConnectedDeviceSummary(
+                            device: connectedDevice,
+                            statusText: viewModel.connectionStatusText,
+                            healthAccessibilityValue: viewModel.connectionHealthAccessibilityValue
+                        )
                     }
                 } header: {
                     Text("ESP32 Devices")
@@ -34,12 +38,25 @@ struct ContentView: View {
                     TextField("TCP port", text: $viewModel.port)
                         .keyboardType(.numberPad)
 
+                    LabeledContent("Board ID") {
+                        TextField("Optional decimal 0-255, except 92", text: $viewModel.manualBoardID)
+                            .keyboardType(.numberPad)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .multilineTextAlignment(.trailing)
+                    }
+
                     HStack {
                         Text("State")
                         Spacer()
                         VStack(alignment: .trailing, spacing: 2) {
-                            Text(viewModel.state.title)
+                            Text(viewModel.connectionStatusText)
                                 .fontWeight(.semibold)
+                                .frame(minWidth: 210, alignment: .trailing)
+                                .transaction { transaction in
+                                    transaction.animation = nil
+                                }
+                                .accessibilityValue(viewModel.connectionHealthAccessibilityValue)
 
                             if let detail = viewModel.state.detail {
                                 Text(detail)
@@ -110,6 +127,8 @@ struct ContentView: View {
 
 private struct ConnectedDeviceSummary: View {
     let device: DiscoveredESP32
+    let statusText: String
+    let healthAccessibilityValue: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -117,10 +136,15 @@ private struct ConnectedDeviceSummary: View {
                 Text(device.serviceName)
                     .fontWeight(.semibold)
                 Spacer()
-                Text("Connected")
+                Text(statusText)
                     .font(.caption)
                     .fontWeight(.semibold)
                     .foregroundStyle(.green)
+                    .frame(minWidth: 190, alignment: .trailing)
+                    .transaction { transaction in
+                        transaction.animation = nil
+                    }
+                    .accessibilityValue(healthAccessibilityValue)
             }
 
             DeviceMetadata(device: device)
@@ -172,6 +196,8 @@ private struct DeviceScannerSheet: View {
                                 device: device,
                                 isConnected: viewModel.connectedEndpointDescription == device.stableEndpointDescription,
                                 isPending: viewModel.pendingSelectedEndpointDescription == device.stableEndpointDescription,
+                                connectedStatusText: viewModel.connectionStatusText,
+                                connectedHealthAccessibilityValue: viewModel.connectionHealthAccessibilityValue,
                                 canConnect: viewModel.canSelectScannedDevice(device)
                             ) {
                                 viewModel.connect(to: device)
@@ -209,6 +235,8 @@ private struct ScannerDeviceRow: View {
     let device: DiscoveredESP32
     let isConnected: Bool
     let isPending: Bool
+    let connectedStatusText: String
+    let connectedHealthAccessibilityValue: String
     let canConnect: Bool
     let connect: () -> Void
 
@@ -221,10 +249,15 @@ private struct ScannerDeviceRow: View {
                             .fontWeight(.semibold)
 
                         if isConnected {
-                            Text("Connected")
+                            Text(connectedStatusText)
                                 .font(.caption)
                                 .fontWeight(.semibold)
                                 .foregroundStyle(.green)
+                                .frame(minWidth: 190, alignment: .leading)
+                                .transaction { transaction in
+                                    transaction.animation = nil
+                                }
+                                .accessibilityValue(connectedHealthAccessibilityValue)
                         } else if isPending {
                             Text("Connecting...")
                                 .font(.caption)

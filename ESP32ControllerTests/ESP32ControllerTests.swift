@@ -758,7 +758,7 @@ struct ESP32ControllerTests {
         client.onStateChange = { states.append($0) }
         client.onFrameReceived = { frames.append($0) }
 
-        client.connect(to: endpoint)
+        client.connect(to: endpoint, boardID: nil)
         endpointConnection.stateUpdateHandler?(.ready)
         await Task.yield()
 
@@ -772,7 +772,7 @@ struct ESP32ControllerTests {
 
         #expect(frames == [[0x01, ESP32TCPClient.frameDelimiter]])
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         receive(Data([0x02, ESP32TCPClient.frameDelimiter]), nil, false, nil)
         await Task.yield()
 
@@ -923,10 +923,10 @@ struct ESP32ControllerTests {
         var states: [TCPConnectionState] = []
         client.onStateChange = { states.append($0) }
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         let staleStateHandler = try #require(connections[0].stateUpdateHandler)
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x04)
         staleStateHandler(.failed(.posix(.ECONNRESET)))
         await Task.yield()
 
@@ -957,10 +957,10 @@ struct ESP32ControllerTests {
         var states: [TCPConnectionState] = []
         client.onStateChange = { states.append($0) }
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         let staleStateHandler = try #require(connections[0].stateUpdateHandler)
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         staleStateHandler(.cancelled)
         await Task.yield()
 
@@ -984,12 +984,12 @@ struct ESP32ControllerTests {
         var frames: [[UInt8]] = []
         client.onFrameReceived = { frames.append($0) }
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         connections[0].stateUpdateHandler?(.ready)
         await Task.yield()
 
         let staleReceive = try #require(connections[0].lastReceiveCompletion)
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
 
         staleReceive(Data([0x01, ESP32TCPClient.frameDelimiter]), nil, false, nil)
         await Task.yield()
@@ -1024,11 +1024,11 @@ struct ESP32ControllerTests {
         }
         var sendResults: [Error?] = []
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x04)
         client.send(Data([0x01])) { sendResults.append($0) }
         let staleSendCompletion = try #require(connections[0].lastSendCompletion)
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         staleSendCompletion(.posix(.ECONNRESET))
         await Task.yield()
 
@@ -1056,7 +1056,7 @@ struct ESP32ControllerTests {
         client.onStateChange = { states.append($0) }
         client.onFrameReceived = { frames.append($0) }
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         connections[0].stateUpdateHandler?(.ready)
         await Task.yield()
 
@@ -1073,7 +1073,7 @@ struct ESP32ControllerTests {
             return false
         })
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         connections[1].stateUpdateHandler?(.ready)
         await Task.yield()
 
@@ -1095,7 +1095,7 @@ struct ESP32ControllerTests {
         var states: [TCPConnectionState] = []
         client.onStateChange = { states.append($0) }
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         connections[0].stateUpdateHandler?(.ready)
         await Task.yield()
 
@@ -1124,12 +1124,12 @@ struct ESP32ControllerTests {
         var states: [TCPConnectionState] = []
         client.onStateChange = { states.append($0) }
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x04)
         connections[0].stateUpdateHandler?(.ready)
         await Task.yield()
         let staleReceive = try #require(connections[0].lastReceiveCompletion)
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         staleReceive(nil, nil, true, nil)
         await Task.yield()
 
@@ -1152,7 +1152,7 @@ struct ESP32ControllerTests {
             return connection
         }
 
-        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort)
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
         connections[0].stateUpdateHandler?(.ready)
         await Task.yield()
 
@@ -1166,6 +1166,1026 @@ struct ESP32ControllerTests {
         #expect(sendResult is TCPClientError)
         #expect(connections[0].sendCallCount == 0)
     }
+
+    @MainActor
+    @Test func heartbeatStartsOnlyAfterReadyAndSendsFirstHeartbeat() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x7A)
+
+        #expect(scheduler.tasks.isEmpty)
+        #expect(connection.sendCallCount == 0)
+
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        #expect(scheduler.tasks.map(\.delay) == [1])
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        let expectedFrame = try #require(ESP32TCPClient.heartbeatRequestFrame(boardID: 0x7A, sequence: 0))
+        #expect(connection.sentContents.map { $0.map(Array.init) } == [expectedFrame])
+        #expect(ackTimeouts.tasks.map(\.delay) == [4])
+    }
+
+    @MainActor
+    @Test func boardIDParserAcceptsOnlyDecimalUInt8Values() {
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "0") == 0x00)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "7") == 0x07)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "10") == 0x0A)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "91") == 0x5B)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "93") == 0x5D)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "255") == 0xFF)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: " 7 ") == 0x07)
+    }
+
+    @MainActor
+    @Test func boardIDParserRejectsHexLookingAndOutOfRangeValues() {
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "A") == nil)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "0A") == nil)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "FF") == nil)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "-1") == nil)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "92") == nil)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "256") == nil)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "") == nil)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: "   ") == nil)
+        #expect(ESP32ControllerViewModel.boardIDByte(from: nil) == nil)
+    }
+
+    @MainActor
+    @Test func manualConnectionWithBlankBoardIDDisablesHeartbeat() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForManualHeartbeatTests(
+            recorder: recorder,
+            heartbeatScheduler: scheduler,
+            ackTimeouts: ackTimeouts
+        )
+
+        viewModel.manualBoardID = "   "
+        viewModel.connect()
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(scheduler.tasks.isEmpty)
+        #expect(ackTimeouts.tasks.isEmpty)
+        #expect(recorder.connections[0].sendCallCount == 0)
+        #expect(viewModel.connectionStatusText == "Connected")
+    }
+
+    @MainActor
+    @Test func waitingForHeartbeatACKDisplaysConnectedStatus() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForManualHeartbeatTests(
+            recorder: recorder,
+            heartbeatScheduler: scheduler,
+            ackTimeouts: ackTimeouts
+        )
+
+        viewModel.manualBoardID = "7"
+        viewModel.connect()
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+        scheduler.tasks[0].fire()
+        await drainMainQueue()
+
+        #expect(viewModel.connectionHealth == .waitingForACK)
+        #expect(viewModel.connectionStatusText == "Connected")
+        #expect(viewModel.connectionHealthAccessibilityValue == "Heartbeat awaiting acknowledgement")
+    }
+
+    @MainActor
+    @Test func manualBoardIDDecimalValuesUseExpectedHeartbeatByte() async throws {
+        let cases: [(String, UInt8)] = [
+            ("0", 0x00),
+            ("7", 0x07),
+            ("10", 0x0A),
+            ("255", 0xFF)
+        ]
+
+        for (boardIDText, expectedByte) in cases {
+            let scheduler = FakeHeartbeatScheduler()
+            let ackTimeouts = FakeHeartbeatScheduler()
+            let recorder = FakeTCPConnectionRecorder()
+            let viewModel = makeViewModelForManualHeartbeatTests(
+                recorder: recorder,
+                heartbeatScheduler: scheduler,
+                ackTimeouts: ackTimeouts
+            )
+
+            viewModel.manualBoardID = boardIDText
+            viewModel.connect()
+            await drainMainQueue()
+            recorder.connections[0].stateUpdateHandler?(.ready)
+            await Task.yield()
+            scheduler.tasks[0].fire()
+            await Task.yield()
+
+            let frame = try #require(recorder.connections[0].sentContents.first??.map { $0 })
+            #expect(frame[3] == expectedByte)
+            let expectedFrame = try #require(ESP32TCPClient.heartbeatRequestFrame(boardID: expectedByte, sequence: 0))
+            #expect(frame == expectedFrame)
+        }
+    }
+
+    @MainActor
+    @Test func invalidNonemptyManualBoardIDPreventsConnection() {
+        for invalidBoardID in ["-1", "256", "0A", "A"] {
+            let scheduler = FakeHeartbeatScheduler()
+            let ackTimeouts = FakeHeartbeatScheduler()
+            let recorder = FakeTCPConnectionRecorder()
+            let viewModel = makeViewModelForManualHeartbeatTests(
+                recorder: recorder,
+                heartbeatScheduler: scheduler,
+                ackTimeouts: ackTimeouts
+            )
+
+            viewModel.manualBoardID = invalidBoardID
+            viewModel.connect()
+
+            #expect(recorder.connections.isEmpty)
+            #expect(scheduler.tasks.isEmpty)
+            #expect(viewModel.state == .failed("Board ID must be a decimal value from 0 through 255"))
+        }
+    }
+
+    @MainActor
+    @Test func manualBoardIDNinetyTwoPreventsConnectionWithReservedMessage() {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForManualHeartbeatTests(
+            recorder: recorder,
+            heartbeatScheduler: scheduler,
+            ackTimeouts: ackTimeouts
+        )
+
+        viewModel.manualBoardID = "92"
+        viewModel.connect()
+
+        #expect(recorder.connections.isEmpty)
+        #expect(scheduler.tasks.isEmpty)
+        #expect(viewModel.state == .failed(ESP32ControllerViewModel.reservedBoardIDMessage))
+    }
+
+    @MainActor
+    @Test func discoveredDecimalBoardIDIsUsedAsHeartbeatFrameByteThree() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let recorder = FakeTCPConnectionRecorder()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in recorder.makeConnection() },
+            endpointConnectionFactory: { _ in recorder.makeConnection() },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        let viewModel = ESP32ControllerViewModel(
+            client: client,
+            discoveryService: ESP32DiscoveryService { FakeESP32Browser() }
+        )
+        let device = makeDevice(id: "service-decimal", serviceName: "ESP32 Decimal", boardID: "10")
+
+        viewModel.connect(to: device)
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        let frame = try #require(recorder.connections[0].sentContents.first??.map { $0 })
+        #expect(frame[3] == 0x0A)
+        let expectedFrame = try #require(ESP32TCPClient.heartbeatRequestFrame(boardID: 0x0A, sequence: 0))
+        #expect(frame == expectedFrame)
+    }
+
+    @MainActor
+    @Test func invalidDiscoveredBoardIDDoesNotInventHeartbeatBoardByte() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let recorder = FakeTCPConnectionRecorder()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in recorder.makeConnection() },
+            endpointConnectionFactory: { _ in recorder.makeConnection() },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        let viewModel = ESP32ControllerViewModel(
+            client: client,
+            discoveryService: ESP32DiscoveryService { FakeESP32Browser() }
+        )
+        let device = makeDevice(id: "service-invalid", serviceName: "ESP32 Invalid", boardID: "0A")
+
+        viewModel.connect(to: device)
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(scheduler.tasks.isEmpty)
+        #expect(recorder.connections[0].sendCallCount == 0)
+    }
+
+    @MainActor
+    @Test func discoveredReservedBoardIDConnectsWithoutHeartbeatAndLogsDiagnostic() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let recorder = FakeTCPConnectionRecorder()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in recorder.makeConnection() },
+            endpointConnectionFactory: { _ in recorder.makeConnection() },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        let viewModel = ESP32ControllerViewModel(
+            client: client,
+            discoveryService: ESP32DiscoveryService { FakeESP32Browser() }
+        )
+        let device = makeDevice(id: "service-reserved", serviceName: "ESP32 Reserved", boardID: "92")
+
+        viewModel.connect(to: device)
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(scheduler.tasks.isEmpty)
+        #expect(ackTimeouts.tasks.isEmpty)
+        #expect(recorder.connections[0].sendCallCount == 0)
+        #expect(viewModel.connectionStatusText == "Connected")
+        let loggedReservedBoardIDDiagnostic = viewModel.logEntries.contains {
+            $0.message == "Heartbeat unavailable: \(ESP32ControllerViewModel.reservedBoardIDMessage)"
+        }
+        #expect(loggedReservedBoardIDDiagnostic)
+    }
+
+    @MainActor
+    @Test func discoveredMissingBoardIDConnectsWithoutHeartbeat() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let recorder = FakeTCPConnectionRecorder()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in recorder.makeConnection() },
+            endpointConnectionFactory: { _ in recorder.makeConnection() },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        let viewModel = ESP32ControllerViewModel(
+            client: client,
+            discoveryService: ESP32DiscoveryService { FakeESP32Browser() }
+        )
+        let device = makeDevice(id: "service-missing", serviceName: "ESP32 Missing", boardID: nil)
+
+        viewModel.connect(to: device)
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(scheduler.tasks.isEmpty)
+        #expect(recorder.connections[0].sendCallCount == 0)
+        #expect(viewModel.connectionStatusText == "Connected")
+    }
+
+    @MainActor
+    @Test func heartbeatDisabledConnectionForwardsACKShapedFrame() async throws {
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(connectionFactory: { _, _ in connection })
+        var frames: [[UInt8]] = []
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: nil)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        let ackShapedFrame = ESP32TCPClient.heartbeatACKFrame(boardID: 0x07, sequence: 0x2A)
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(Data(ackShapedFrame), nil, false, nil)
+        await Task.yield()
+
+        #expect(frames == [ackShapedFrame])
+    }
+
+    @MainActor
+    @Test func heartbeatDisabledConnectionForwardsValidNineByteACKShape() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var frames: [[UInt8]] = []
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: nil)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        let ackShapedFrame: [UInt8] = [0x2F, 0x74, 0x61, 0x00, 0x68, 0x62, 0x41, 0x46, 0x5C]
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(Data(ackShapedFrame), nil, false, nil)
+        await Task.yield()
+
+        #expect(scheduler.tasks.isEmpty)
+        #expect(ackTimeouts.tasks.isEmpty)
+        #expect(frames == [ackShapedFrame])
+    }
+
+    @MainActor
+    @Test func heartbeatFrameEncodingUsesUppercaseHex() throws {
+        let expectedRequestFrame = try #require(ESP32TCPClient.heartbeatRequestFrame(boardID: 0x41, sequence: 0xAF))
+        #expect(expectedRequestFrame == [
+            0x2F, 0x54, 0x41, 0x41, 0x48, 0x42, 0x41, 0x46, 0x5C
+        ])
+        #expect(ESP32TCPClient.heartbeatACKFrame(boardID: 0x41, sequence: 0xAF) == [
+            0x2F, 0x74, 0x61, 0x41, 0x68, 0x62, 0x41, 0x46, 0x5C
+        ])
+        #expect(ESP32TCPClient.heartbeatRequestFrame(boardID: 0x5C, sequence: 0xAF) == nil)
+    }
+
+    @MainActor
+    @Test func heartbeatSequenceRollsOverFromFFTo00() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x22)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        for sequence in 0...256 {
+            try fireLatestActiveHeartbeatTask(scheduler)
+            await Task.yield()
+            let expectedSequence = UInt8(truncatingIfNeeded: sequence)
+            let expectedFrame = try #require(ESP32TCPClient.heartbeatRequestFrame(boardID: 0x22, sequence: expectedSequence))
+            #expect(connection.sentContents.last??.map { $0 } == expectedFrame)
+
+            let receive = try #require(connection.lastReceiveCompletion)
+            receive(Data(ESP32TCPClient.heartbeatACKFrame(boardID: 0x22, sequence: expectedSequence)), nil, false, nil)
+            await Task.yield()
+        }
+
+        let expectedFFFrame = try #require(ESP32TCPClient.heartbeatRequestFrame(boardID: 0x22, sequence: 0xFF))
+        let expected00Frame = try #require(ESP32TCPClient.heartbeatRequestFrame(boardID: 0x22, sequence: 0x00))
+        #expect(connection.sentContents[255].map(Array.init) == expectedFFFrame)
+        #expect(connection.sentContents[256].map(Array.init) == expected00Frame)
+    }
+
+    @MainActor
+    @Test func matchingACKResetsMissedCountAndIsNotForwarded() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var health: [ConnectionHealthState] = []
+        var frames: [[UInt8]] = []
+        client.onConnectionHealthChange = { health.append($0) }
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x01)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(Data(ESP32TCPClient.heartbeatACKFrame(boardID: 0x01, sequence: 0)), nil, false, nil)
+        await Task.yield()
+
+        #expect(frames.isEmpty)
+        #expect(ackTimeouts.tasks[0].isCancelled)
+        #expect(health.suffix(2) == [.waitingForACK, .healthy])
+    }
+
+    @MainActor
+    @Test func wrongSequenceOrBoardACKDoesNotResetMissedCount() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var health: [ConnectionHealthState] = []
+        var frames: [[UInt8]] = []
+        client.onConnectionHealthChange = { health.append($0) }
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x02)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        let receive = try #require(connection.lastReceiveCompletion)
+        let wrongSequenceFrame = ESP32TCPClient.heartbeatACKFrame(boardID: 0x02, sequence: 1)
+        let wrongBoardFrame = ESP32TCPClient.heartbeatACKFrame(boardID: 0x03, sequence: 0)
+        receive(Data(wrongSequenceFrame), nil, false, nil)
+        receive(Data(wrongBoardFrame), nil, false, nil)
+        ackTimeouts.tasks[0].fire()
+        await Task.yield()
+
+        #expect(frames == [wrongSequenceFrame, wrongBoardFrame])
+        #expect(health.last == .degraded(missedCount: 1))
+        #expect(connection.cancelCallCount == 0)
+    }
+
+    @MainActor
+    @Test func matchingACKForDecimalBoardIDSevenResetsMissedCount() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var health: [ConnectionHealthState] = []
+        var frames: [[UInt8]] = []
+        client.onConnectionHealthChange = { health.append($0) }
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x07)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(Data(ESP32TCPClient.heartbeatACKFrame(boardID: 0x07, sequence: 0)), nil, false, nil)
+        await Task.yield()
+
+        #expect(health.last == .healthy)
+        #expect(ackTimeouts.tasks[0].isCancelled)
+    }
+
+    @MainActor
+    @Test func wrongBoardByteForDecimalBoardIDSevenIsRejected() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var health: [ConnectionHealthState] = []
+        var frames: [[UInt8]] = []
+        client.onConnectionHealthChange = { health.append($0) }
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x07)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        let receive = try #require(connection.lastReceiveCompletion)
+        let wrongBoardFrame = ESP32TCPClient.heartbeatACKFrame(boardID: 0x37, sequence: 0)
+        receive(Data(wrongBoardFrame), nil, false, nil)
+        ackTimeouts.tasks[0].fire()
+        await Task.yield()
+
+        #expect(frames == [wrongBoardFrame])
+        #expect(health.last == .degraded(missedCount: 1))
+        #expect(connection.cancelCallCount == 0)
+    }
+
+    @MainActor
+    @Test func ackShapedFrameWithNoPendingHeartbeatIsForwarded() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var frames: [[UInt8]] = []
+        var health: [ConnectionHealthState] = []
+        client.onFrameReceived = { frames.append($0) }
+        client.onConnectionHealthChange = { health.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x07)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        let ackShapedFrame = ESP32TCPClient.heartbeatACKFrame(boardID: 0x07, sequence: 0)
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(Data(ackShapedFrame), nil, false, nil)
+        await Task.yield()
+
+        #expect(frames == [ackShapedFrame])
+        #expect(ackTimeouts.tasks.isEmpty)
+        #expect(health.last == .healthy)
+    }
+
+    @MainActor
+    @Test func malformedACKIsForwardedAsNormalFrame() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var frames: [[UInt8]] = []
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x02)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        let malformed: [UInt8] = [0x2F, 0x74, 0x61, 0x02, 0x68, 0x62, 0x47, 0x47, 0x5C]
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(Data(malformed), nil, false, nil)
+        await Task.yield()
+
+        #expect(frames == [malformed])
+    }
+
+    @MainActor
+    @Test func ordinaryNonHeartbeatFrameIsForwarded() async throws {
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(connectionFactory: { _, _ in connection })
+        var frames: [[UInt8]] = []
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x02)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        let ordinaryFrame: [UInt8] = [0x2F, 0x54, 0x41, 0x02, 0x4F, 0x4B, 0x5C]
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(Data(ordinaryFrame), nil, false, nil)
+        await Task.yield()
+
+        #expect(frames == [ordinaryFrame])
+    }
+
+    @MainActor
+    @Test func timeoutIncrementsMissCountAndThreeTimeoutsDisconnect() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var health: [ConnectionHealthState] = []
+        var states: [TCPConnectionState] = []
+        client.onConnectionHealthChange = { health.append($0) }
+        client.onStateChange = { states.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        for missed in 1...3 {
+            try fireLatestActiveHeartbeatTask(scheduler)
+            await Task.yield()
+            try fireLatestActiveHeartbeatTask(ackTimeouts)
+            await Task.yield()
+
+            if missed < 3 {
+                #expect(health.last == .degraded(missedCount: missed))
+                #expect(connection.cancelCallCount == 0)
+            }
+        }
+
+        #expect(health.contains(.timedOut))
+        #expect(states.last == .failed("Heartbeat timed out"))
+        #expect(connection.cancelCallCount == 1)
+    }
+
+    @MainActor
+    @Test func successfulACKAfterOneMissResetsCount() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var health: [ConnectionHealthState] = []
+        var frames: [[UInt8]] = []
+        client.onConnectionHealthChange = { health.append($0) }
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x05)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        try fireLatestActiveHeartbeatTask(scheduler)
+        await Task.yield()
+        try fireLatestActiveHeartbeatTask(ackTimeouts)
+        await Task.yield()
+
+        try fireLatestActiveHeartbeatTask(scheduler)
+        await Task.yield()
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(Data(ESP32TCPClient.heartbeatACKFrame(boardID: 0x05, sequence: 1)), nil, false, nil)
+        await Task.yield()
+
+        #expect(health.last == .healthy)
+
+        try fireLatestActiveHeartbeatTask(scheduler)
+        await Task.yield()
+        try fireLatestActiveHeartbeatTask(ackTimeouts)
+        await Task.yield()
+
+        #expect(health.last == .degraded(missedCount: 1))
+        #expect(connection.cancelCallCount == 0)
+    }
+
+    @MainActor
+    @Test func onlyOneHeartbeatMayBeOutstanding() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatConfiguration: HeartbeatConfiguration(interval: 12, ackTimeout: 30, maximumConsecutiveMisses: 3),
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        #expect(connection.sendCallCount == 1)
+
+        try fireLatestActiveHeartbeatTask(scheduler)
+        await Task.yield()
+
+        #expect(connection.sendCallCount == 1)
+        #expect(ackTimeouts.tasks.count == 1)
+    }
+
+    @MainActor
+    @Test func connectionWithoutHeartbeatSendsNoHeartbeatFrames() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: nil)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        #expect(scheduler.tasks.isEmpty)
+        #expect(ackTimeouts.tasks.isEmpty)
+        #expect(connection.sentContents.isEmpty)
+    }
+
+    @MainActor
+    @Test func lowLevelHostConnectWithReservedBoardIDDoesNotEnableHeartbeatOrSendMalformedFrame() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x5C)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        #expect(scheduler.tasks.isEmpty)
+        #expect(ackTimeouts.tasks.isEmpty)
+        #expect(connection.sentContents.isEmpty)
+    }
+
+    @MainActor
+    @Test func lowLevelEndpointConnectWithReservedBoardIDDoesNotEnableHeartbeat() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            endpointConnectionFactory: { _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+
+        client.connect(
+            to: .service(name: "ESP32 Reserved", type: ESP32DiscoveryService.serviceType, domain: "local", interface: nil),
+            boardID: 0x5C
+        )
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        #expect(scheduler.tasks.isEmpty)
+        #expect(ackTimeouts.tasks.isEmpty)
+        #expect(connection.sentContents.isEmpty)
+    }
+
+    @MainActor
+    @Test func previousHeartbeatEnabledConnectionDoesNotLeakIntoDisabledConnection() async throws {
+        var connections: [FakeTCPConnection] = []
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in
+                let connection = FakeTCPConnection()
+                connections.append(connection)
+                return connection
+            },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var health: [ConnectionHealthState] = []
+        var frames: [[UInt8]] = []
+        client.onConnectionHealthChange = { health.append($0) }
+        client.onFrameReceived = { frames.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x07)
+        connections[0].stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        #expect(connections[0].sendCallCount == 1)
+        #expect(ackTimeouts.tasks.count == 1)
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: nil)
+        connections[1].stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        #expect(ackTimeouts.tasks[0].isCancelled)
+        #expect(health.last == .idle)
+        #expect(connections[1].sendCallCount == 0)
+        let replacementHeartbeatTasksCancelled = scheduler.tasks.dropFirst().allSatisfy { $0.isCancelled }
+        #expect(replacementHeartbeatTasksCancelled)
+
+        let staleACKShapedFrame = ESP32TCPClient.heartbeatACKFrame(boardID: 0x07, sequence: 0)
+        let receive = try #require(connections[1].lastReceiveCompletion)
+        receive(Data(staleACKShapedFrame), nil, false, nil)
+        await Task.yield()
+
+        #expect(frames == [staleACKShapedFrame])
+        #expect(health.last == .idle)
+    }
+
+    @MainActor
+    @Test func previousDiscoveredHeartbeatBoardIDDoesNotLeakIntoReservedDiscoveredConnection() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let recorder = FakeTCPConnectionRecorder()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in recorder.makeConnection() },
+            endpointConnectionFactory: { _ in recorder.makeConnection() },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        let viewModel = ESP32ControllerViewModel(
+            client: client,
+            discoveryService: ESP32DiscoveryService { FakeESP32Browser() }
+        )
+        let validDevice = makeDevice(id: "service-valid", serviceName: "ESP32 Valid", boardID: "7")
+        let reservedDevice = makeDevice(id: "service-reserved", serviceName: "ESP32 Reserved", boardID: "92")
+
+        viewModel.connect(to: validDevice)
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        #expect(recorder.connections[0].sendCallCount == 1)
+        #expect(ackTimeouts.tasks.count == 1)
+
+        viewModel.connect(to: reservedDevice)
+        await drainMainQueue()
+        recorder.connections[1].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(ackTimeouts.tasks[0].isCancelled)
+        #expect(recorder.connections[1].sendCallCount == 0)
+        let replacementHeartbeatTasksCancelled = scheduler.tasks.dropFirst().allSatisfy { $0.isCancelled }
+        #expect(replacementHeartbeatTasksCancelled)
+        #expect(viewModel.connectionStatusText == "Connected")
+        let loggedReservedBoardIDDiagnostic = viewModel.logEntries.contains {
+            $0.message == "Heartbeat unavailable: \(ESP32ControllerViewModel.reservedBoardIDMessage)"
+        }
+        #expect(loggedReservedBoardIDDiagnostic)
+    }
+
+    @MainActor
+    @Test func staleHeartbeatTimeoutCannotCancelNewerConnection() async throws {
+        var connections: [FakeTCPConnection] = []
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in
+                let connection = FakeTCPConnection()
+                connections.append(connection)
+                return connection
+            },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x04)
+        connections[0].stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+        let staleTimeout = ackTimeouts.tasks[0]
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: nil)
+        connections[1].stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        staleTimeout.fireIgnoringCancellationForTesting()
+        await Task.yield()
+
+        #expect(connections[1].cancelCallCount == 0)
+        #expect(connections[0].cancelCallCount == 1)
+    }
+
+    @MainActor
+    @Test func staleACKCannotAffectNewerConnection() async throws {
+        var connections: [FakeTCPConnection] = []
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in
+                let connection = FakeTCPConnection()
+                connections.append(connection)
+                return connection
+            },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var health: [ConnectionHealthState] = []
+        client.onConnectionHealthChange = { health.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x09)
+        connections[0].stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+        let staleReceive = try #require(connections[0].lastReceiveCompletion)
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x09)
+        connections[1].stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        staleReceive(Data(ESP32TCPClient.heartbeatACKFrame(boardID: 0x09, sequence: 0)), nil, false, nil)
+        await Task.yield()
+
+        #expect(health.last == .healthy)
+        #expect(connections[1].cancelCallCount == 0)
+    }
+
+    @MainActor
+    @Test func disconnectCancelsHeartbeatLoopAndACKTimeout() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        client.disconnect()
+
+        #expect(scheduler.tasks.contains { $0.isCancelled })
+        #expect(ackTimeouts.tasks[0].isCancelled)
+    }
+
+    @MainActor
+    @Test func remoteDisconnectCancelsHeartbeatResources() async throws {
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let connection = FakeTCPConnection()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in connection },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x00)
+        connection.stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(nil, nil, true, nil)
+        await Task.yield()
+
+        #expect(ackTimeouts.tasks[0].isCancelled)
+        #expect(connection.cancelCallCount == 1)
+    }
+
+    @MainActor
+    @Test func replacementConnectionReceivesIndependentHeartbeatState() async throws {
+        var connections: [FakeTCPConnection] = []
+        let scheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in
+                let connection = FakeTCPConnection()
+                connections.append(connection)
+                return connection
+            },
+            heartbeatScheduler: scheduler.schedule(_:_:),
+            heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+        )
+        var health: [ConnectionHealthState] = []
+        client.onConnectionHealthChange = { health.append($0) }
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x0A)
+        connections[0].stateUpdateHandler?(.ready)
+        await Task.yield()
+        scheduler.tasks[0].fire()
+        await Task.yield()
+        ackTimeouts.tasks[0].fire()
+        await Task.yield()
+
+        #expect(health.last == .degraded(missedCount: 1))
+
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: 0x0A)
+        connections[1].stateUpdateHandler?(.ready)
+        await Task.yield()
+
+        #expect(health.last == .healthy)
+        try fireLatestActiveHeartbeatTask(scheduler)
+        await Task.yield()
+
+        let receive = try #require(connections[1].lastReceiveCompletion)
+        receive(Data(ESP32TCPClient.heartbeatACKFrame(boardID: 0x0A, sequence: 1)), nil, false, nil)
+        await Task.yield()
+
+        #expect(health.last == .healthy)
+        #expect(connections[1].cancelCallCount == 0)
+    }
+}
+
+private func fireLatestActiveHeartbeatTask(_ scheduler: FakeHeartbeatScheduler) throws {
+    let task = try #require(scheduler.tasks.last { !$0.isCancelled })
+    task.fire()
+}
+
+@MainActor
+private func makeViewModelForManualHeartbeatTests(
+    recorder: FakeTCPConnectionRecorder,
+    heartbeatScheduler: FakeHeartbeatScheduler,
+    ackTimeouts: FakeHeartbeatScheduler
+) -> ESP32ControllerViewModel {
+    let client = ESP32TCPClient(
+        connectionFactory: { _, _ in recorder.makeConnection() },
+        endpointConnectionFactory: { _ in recorder.makeConnection() },
+        heartbeatScheduler: heartbeatScheduler.schedule(_:_:),
+        heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
+    )
+
+    return ESP32ControllerViewModel(
+        client: client,
+        discoveryService: ESP32DiscoveryService { FakeESP32Browser() }
+    )
 }
 
 private func makeBrowseResult(
@@ -1342,6 +2362,45 @@ private final class FakeCancellableTask: CancellableTask {
     }
 }
 
+private final class FakeHeartbeatScheduler {
+    var tasks: [FakeScheduledHeartbeatTask] = []
+
+    func schedule(_ delay: TimeInterval, _ callback: @escaping @Sendable () -> Void) -> CancellableTask {
+        let task = FakeScheduledHeartbeatTask(delay: delay, callback: callback)
+        tasks.append(task)
+        return task
+    }
+}
+
+private final class FakeScheduledHeartbeatTask: CancellableTask {
+    let delay: TimeInterval
+    private let callback: @Sendable () -> Void
+    var cancelCallCount = 0
+    var isCancelled = false
+
+    init(delay: TimeInterval, callback: @escaping @Sendable () -> Void) {
+        self.delay = delay
+        self.callback = callback
+    }
+
+    func cancel() {
+        cancelCallCount += 1
+        isCancelled = true
+    }
+
+    func fire() {
+        guard !isCancelled else {
+            return
+        }
+
+        callback()
+    }
+
+    func fireIgnoringCancellationForTesting() {
+        callback()
+    }
+}
+
 @MainActor
 private func drainMainQueue() async {
     await withCheckedContinuation { continuation in
@@ -1375,6 +2434,7 @@ private final class FakeTCPConnection: TCPConnection {
     var sendCallCount = 0
     var lastReceiveCompletion: ReceiveCompletion?
     var lastSendCompletion: ((NWError?) -> Void)?
+    var sentContents: [Data?] = []
 
     func start(queue: DispatchQueue) {}
 
@@ -1389,6 +2449,7 @@ private final class FakeTCPConnection: TCPConnection {
         completion: NWConnection.SendCompletion
     ) {
         sendCallCount += 1
+        sentContents.append(content)
 
         guard case let .contentProcessed(sendCompletion) = completion else {
             return

@@ -39,34 +39,70 @@ final class ESP32TCPClient {
     typealias FrameHandler = ([UInt8]) -> Void
     typealias HostConnectionFactory = (IPv4Address, NWEndpoint.Port) -> TCPConnection
     typealias EndpointConnectionFactory = (NWEndpoint) -> TCPConnection
+    typealias HeartbeatScheduler = (TimeInterval, @escaping @Sendable () -> Void) -> CancellableTask
 
     static let defaultPort: UInt16 = 5000
     static let frameDelimiter: UInt8 = 0x5C
+    static let reservedBoardID: UInt8 = frameDelimiter
+    nonisolated static let defaultHeartbeatConfiguration = HeartbeatConfiguration(
+        interval: 12,
+        ackTimeout: 4,
+        maximumConsecutiveMisses: 3
+    )
 
     var onStateChange: StateHandler?
     var onFrameReceived: FrameHandler?
+    var onConnectionHealthChange: ((ConnectionHealthState) -> Void)?
+    var isHeartbeatDebugLoggingEnabled = false
 
     private let queue = DispatchQueue(label: "ESP32Controller.TCPClient")
     private let hostConnectionFactory: HostConnectionFactory
     private let endpointConnectionFactory: EndpointConnectionFactory
+    private let heartbeatConfiguration: HeartbeatConfiguration
+    private let heartbeatScheduler: HeartbeatScheduler
+    private let heartbeatACKTimeoutScheduler: HeartbeatScheduler
     private var connection: TCPConnection?
     private var activeConnectionID: UUID?
     private var receiveBuffer: [UInt8] = []
+    private var boardID: UInt8?
+    private var heartbeatSequence: UInt8 = 0
+    private var awaitingHeartbeatSequence: UInt8?
+    private var missedHeartbeatCount = 0
+    private var heartbeatLoopTask: CancellableTask?
+    private var heartbeatACKTimeoutTask: CancellableTask?
+    private var isHeartbeatEnabledForActiveConnection = false
 
     init(
         connectionFactory: @escaping HostConnectionFactory = { address, port in
-            NWConnection(host: .ipv4(address), port: port, using: .tcp)
+            NWConnection(host: .ipv4(address), port: port, using: ESP32TCPClient.tcpParameters())
         },
         endpointConnectionFactory: @escaping EndpointConnectionFactory = { endpoint in
-            NWConnection(to: endpoint, using: .tcp)
+            NWConnection(to: endpoint, using: ESP32TCPClient.tcpParameters())
+        },
+        heartbeatConfiguration: HeartbeatConfiguration = ESP32TCPClient.defaultHeartbeatConfiguration,
+        heartbeatScheduler: @escaping HeartbeatScheduler = { delay, callback in
+            let workItem = DispatchWorkItem(block: callback)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+            return TCPDispatchWorkItemCancellable(workItem: workItem)
+        },
+        heartbeatACKTimeoutScheduler: @escaping HeartbeatScheduler = { delay, callback in
+            let workItem = DispatchWorkItem(block: callback)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+            return TCPDispatchWorkItemCancellable(workItem: workItem)
         }
     ) {
         self.hostConnectionFactory = connectionFactory
         self.endpointConnectionFactory = endpointConnectionFactory
+        self.heartbeatConfiguration = heartbeatConfiguration
+        self.heartbeatScheduler = heartbeatScheduler
+        self.heartbeatACKTimeoutScheduler = heartbeatACKTimeoutScheduler
     }
 
-    func connect(host: String, port: UInt16) {
+    func connect(host: String, port: UInt16, boardID: UInt8?) {
         disconnect()
+        let heartbeatBoardID = Self.validHeartbeatBoardID(from: boardID)
+        self.boardID = heartbeatBoardID
+        isHeartbeatEnabledForActiveConnection = heartbeatBoardID != nil
 
         guard let address = IPv4Address(host) else {
             onStateChange?(.failed("Invalid IPv4 address"))
@@ -81,8 +117,11 @@ final class ESP32TCPClient {
         startConnection(hostConnectionFactory(address, nwPort))
     }
 
-    func connect(to endpoint: NWEndpoint) {
+    func connect(to endpoint: NWEndpoint, boardID: UInt8?) {
         disconnect()
+        let heartbeatBoardID = Self.validHeartbeatBoardID(from: boardID)
+        self.boardID = heartbeatBoardID
+        isHeartbeatEnabledForActiveConnection = heartbeatBoardID != nil
         startConnection(endpointConnectionFactory(endpoint))
     }
 
@@ -108,11 +147,15 @@ final class ESP32TCPClient {
     }
 
     func disconnect() {
+        stopHeartbeat()
+        boardID = nil
+        isHeartbeatEnabledForActiveConnection = false
         receiveBuffer.removeAll(keepingCapacity: true)
         activeConnectionID = nil
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
+        publishHealth(.idle)
         onStateChange?(.disconnected)
     }
 
@@ -158,18 +201,29 @@ final class ESP32TCPClient {
         case .ready:
             onStateChange?(.connected)
             receiveNextChunk(for: connectionID, connection: connection)
+            if isHeartbeatEnabledForActiveConnection, boardID != nil {
+                startHeartbeat(for: connectionID, connection: connection)
+            } else {
+                publishHealth(.idle)
+            }
         case let .failed(error):
+            stopHeartbeat()
             onStateChange?(.failed(error.localizedDescription))
             connection.cancel()
             if isActiveConnection(connectionID, connection: connection) {
                 self.connection = nil
                 activeConnectionID = nil
+                boardID = nil
+                isHeartbeatEnabledForActiveConnection = false
             }
         case .cancelled:
+            stopHeartbeat()
             onStateChange?(.disconnected)
             if isActiveConnection(connectionID, connection: connection) {
                 self.connection = nil
                 activeConnectionID = nil
+                boardID = nil
+                isHeartbeatEnabledForActiveConnection = false
             }
         @unknown default:
             onStateChange?(.failed("Unknown connection state"))
@@ -248,7 +302,9 @@ final class ESP32TCPClient {
         while let delimiterIndex = receiveBuffer.firstIndex(of: Self.frameDelimiter) {
             let frame = Array(receiveBuffer[...delimiterIndex])
             receiveBuffer.removeSubrange(...delimiterIndex)
-            onFrameReceived?(frame)
+            if !handleHeartbeatACKFrame(frame) {
+                onFrameReceived?(frame)
+            }
         }
     }
 
@@ -267,10 +323,253 @@ final class ESP32TCPClient {
 
         connection.stateUpdateHandler = nil
         connection.cancel()
+        stopHeartbeat()
         receiveBuffer.removeAll(keepingCapacity: true)
         self.connection = nil
         activeConnectionID = nil
+        boardID = nil
+        isHeartbeatEnabledForActiveConnection = false
         onStateChange?(state)
+    }
+
+    private func startHeartbeat(for connectionID: UUID, connection: TCPConnection) {
+        guard isActiveConnection(connectionID, connection: connection) else {
+            return
+        }
+
+        stopHeartbeat()
+        missedHeartbeatCount = 0
+        awaitingHeartbeatSequence = nil
+        publishHealth(.healthy)
+        scheduleHeartbeat(after: 1, connectionID: connectionID, connection: connection)
+    }
+
+    private func scheduleHeartbeat(after delay: TimeInterval, connectionID: UUID, connection: TCPConnection) {
+        let callbackContext = ConnectionCallbackContext(connectionID: connectionID, connection: connection)
+        heartbeatLoopTask = heartbeatScheduler(delay) { [weak self, callbackContext] in
+            Task { @MainActor [weak self, callbackContext] in
+                guard
+                    let self,
+                    let connection = callbackContext.connection,
+                    self.isActiveConnection(callbackContext.connectionID, connection: connection)
+                else {
+                    return
+                }
+
+                self.heartbeatLoopTask = nil
+                self.sendHeartbeatIfNeeded(for: callbackContext.connectionID, connection: connection)
+                if self.isActiveConnection(callbackContext.connectionID, connection: connection) {
+                    self.scheduleHeartbeat(
+                        after: self.heartbeatConfiguration.interval,
+                        connectionID: callbackContext.connectionID,
+                        connection: connection
+                    )
+                }
+            }
+        }
+    }
+
+    private func sendHeartbeatIfNeeded(for connectionID: UUID, connection: TCPConnection) {
+        guard isActiveConnection(connectionID, connection: connection), awaitingHeartbeatSequence == nil else {
+            return
+        }
+
+        let sequence = heartbeatSequence
+        heartbeatSequence &+= 1
+        guard let boardID else {
+            return
+        }
+
+        guard let frame = Self.heartbeatRequestFrame(boardID: boardID, sequence: sequence) else {
+            awaitingHeartbeatSequence = nil
+            publishHealth(.idle)
+            return
+        }
+
+        awaitingHeartbeatSequence = sequence
+        publishHealth(.waitingForACK)
+        scheduleHeartbeatACKTimeout(for: connectionID, connection: connection, sequence: sequence)
+
+        let callbackContext = ConnectionCallbackContext(connectionID: connectionID, connection: connection)
+        connection.send(content: Data(frame), contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { error in
+            Task { @MainActor [weak self, callbackContext] in
+                guard
+                    let self,
+                    let connection = callbackContext.connection,
+                    self.isActiveConnection(callbackContext.connectionID, connection: connection)
+                else {
+                    return
+                }
+
+                if let error {
+                    self.terminateActiveConnection(
+                        callbackContext.connectionID,
+                        connection: connection,
+                        state: .failed(error.localizedDescription)
+                    )
+                }
+            }
+        })
+    }
+
+    private func scheduleHeartbeatACKTimeout(
+        for connectionID: UUID,
+        connection: TCPConnection,
+        sequence: UInt8
+    ) {
+        heartbeatACKTimeoutTask?.cancel()
+        let callbackContext = ConnectionCallbackContext(connectionID: connectionID, connection: connection)
+        heartbeatACKTimeoutTask = heartbeatACKTimeoutScheduler(heartbeatConfiguration.ackTimeout) { [weak self, callbackContext] in
+            Task { @MainActor [weak self, callbackContext] in
+                guard
+                    let self,
+                    let connection = callbackContext.connection,
+                    self.isActiveConnection(callbackContext.connectionID, connection: connection),
+                    self.awaitingHeartbeatSequence == sequence
+                else {
+                    return
+                }
+
+                self.heartbeatACKTimeoutTask = nil
+                self.awaitingHeartbeatSequence = nil
+                self.missedHeartbeatCount += 1
+
+                if self.missedHeartbeatCount >= self.heartbeatConfiguration.maximumConsecutiveMisses {
+                    self.publishHealth(.timedOut)
+                    self.terminateActiveConnection(
+                        callbackContext.connectionID,
+                        connection: connection,
+                        state: .failed("Heartbeat timed out")
+                    )
+                } else {
+                    self.publishHealth(.degraded(missedCount: self.missedHeartbeatCount))
+                }
+            }
+        }
+    }
+
+    private func handleHeartbeatACKFrame(_ frame: [UInt8]) -> Bool {
+        guard
+            isHeartbeatEnabledForActiveConnection,
+            let boardID,
+            let pendingSequence = awaitingHeartbeatSequence,
+            Self.isHeartbeatACKCandidate(frame),
+            frame[3] == boardID,
+            let sequence = Self.decodeHexByte(high: frame[6], low: frame[7]),
+            pendingSequence == sequence
+        else {
+            return false
+        }
+
+        heartbeatACKTimeoutTask?.cancel()
+        heartbeatACKTimeoutTask = nil
+        awaitingHeartbeatSequence = nil
+        missedHeartbeatCount = 0
+        publishHealth(.healthy)
+        return true
+    }
+
+    private func stopHeartbeat() {
+        heartbeatLoopTask?.cancel()
+        heartbeatLoopTask = nil
+        heartbeatACKTimeoutTask?.cancel()
+        heartbeatACKTimeoutTask = nil
+        awaitingHeartbeatSequence = nil
+        missedHeartbeatCount = 0
+    }
+
+    private func publishHealth(_ health: ConnectionHealthState) {
+        onConnectionHealthChange?(health)
+    }
+
+    static func heartbeatRequestFrame(boardID: UInt8, sequence: UInt8) -> [UInt8]? {
+        guard boardID != reservedBoardID else {
+            return nil
+        }
+
+        let hex = hexASCII(for: sequence)
+        return [0x2F, 0x54, 0x41, boardID, 0x48, 0x42, hex.high, hex.low, frameDelimiter]
+    }
+
+    private static func validHeartbeatBoardID(from boardID: UInt8?) -> UInt8? {
+        guard let boardID, boardID != reservedBoardID else {
+            return nil
+        }
+
+        return boardID
+    }
+
+    static func heartbeatACKFrame(boardID: UInt8, sequence: UInt8) -> [UInt8] {
+        let hex = hexASCII(for: sequence)
+        return [0x2F, 0x74, 0x61, boardID, 0x68, 0x62, hex.high, hex.low, frameDelimiter]
+    }
+
+    private static func isHeartbeatACKCandidate(_ frame: [UInt8]) -> Bool {
+        frame.count == 9 &&
+            frame[0] == 0x2F &&
+            frame[1] == 0x74 &&
+            frame[2] == 0x61 &&
+            frame[4] == 0x68 &&
+            frame[5] == 0x62 &&
+            decodeHexByte(high: frame[6], low: frame[7]) != nil &&
+            frame[8] == frameDelimiter
+    }
+
+    private static func hexASCII(for byte: UInt8) -> (high: UInt8, low: UInt8) {
+        let digits = Array("0123456789ABCDEF".utf8)
+        return (digits[Int(byte >> 4)], digits[Int(byte & 0x0F)])
+    }
+
+    private static func decodeHexByte(high: UInt8, low: UInt8) -> UInt8? {
+        guard let highNibble = hexNibble(high), let lowNibble = hexNibble(low) else {
+            return nil
+        }
+
+        return (highNibble << 4) | lowNibble
+    }
+
+    private static func hexNibble(_ byte: UInt8) -> UInt8? {
+        switch byte {
+        case 0x30...0x39:
+            byte - 0x30
+        case 0x41...0x46:
+            byte - 0x41 + 10
+        case 0x61...0x66:
+            byte - 0x61 + 10
+        default:
+            nil
+        }
+    }
+
+    private nonisolated static func tcpParameters() -> NWParameters {
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveIdle = 15
+        tcpOptions.keepaliveInterval = 5
+        tcpOptions.keepaliveCount = 3
+        return NWParameters(tls: nil, tcp: tcpOptions)
+    }
+}
+
+struct HeartbeatConfiguration: Equatable {
+    let interval: TimeInterval
+    let ackTimeout: TimeInterval
+    let maximumConsecutiveMisses: Int
+}
+
+enum ConnectionHealthState: Equatable {
+    case idle
+    case healthy
+    case waitingForACK
+    case degraded(missedCount: Int)
+    case timedOut
+}
+
+private struct TCPDispatchWorkItemCancellable: CancellableTask {
+    let workItem: DispatchWorkItem
+
+    func cancel() {
+        workItem.cancel()
     }
 }
 
