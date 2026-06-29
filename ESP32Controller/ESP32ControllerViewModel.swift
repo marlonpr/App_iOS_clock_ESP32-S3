@@ -29,6 +29,17 @@ final class ESP32ControllerViewModel: ObservableObject {
     @Published private(set) var logEntries: [CommunicationLogEntry] = []
     @Published var outgoingHex = ""
     @Published var appendFrameDelimiter = true
+    @Published var is24HourFormat = true
+    @Published var brightnessLevel: Double = 5 {
+        didSet {
+            let clamped = min(max(brightnessLevel, 1), 10)
+            if brightnessLevel != clamped {
+                brightnessLevel = clamped
+            }
+        }
+    }
+    @Published var commandStatusMessage: String?
+    @Published var isResetConfirmationPresented = false
 
     static let reservedBoardIDMessage = "Board ID 92 is reserved because it equals the protocol frame delimiter 0x5C."
 
@@ -37,6 +48,8 @@ final class ESP32ControllerViewModel: ObservableObject {
     private let maxLogEntries = 200
     private var pendingConnectionEndpointDescription: String?
     private var pendingConnectionDevice: DiscoveredESP32?
+    private var pendingProtocolBoardID: UInt8?
+    private var connectedProtocolBoardID: UInt8?
     private var connectionAttempt: ConnectionAttempt = .idle
     private var isExpectingInitialDisconnect = false
     private var cancellables: Set<AnyCancellable> = []
@@ -61,6 +74,22 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     var canSend: Bool {
         state == .connected
+    }
+
+    var canUseClockControls: Bool {
+        state == .connected && connectedProtocolBoardID != nil
+    }
+
+    var clockControlsUnavailableMessage: String? {
+        guard state == .connected else {
+            return "Connect to an ESP32 before using clock controls."
+        }
+
+        guard connectedProtocolBoardID != nil else {
+            return "Clock controls require a valid protocol Board ID. Enter a manual decimal Board ID from 0 through 255 except 92, or connect to a discovered device that advertises one."
+        }
+
+        return nil
     }
 
     var connectionStatusText: String {
@@ -210,6 +239,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             return
         }
 
+        pendingProtocolBoardID = parsedBoardID
         beginConnectionAttempt(.manual)
         client.connect(
             host: host.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -229,6 +259,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         beginConnectionAttempt(.discovered(device.stableEndpointDescription))
 
         let boardID = Self.boardIDByte(from: device.boardID)
+        pendingProtocolBoardID = boardID
         if boardID == nil, Self.isReservedBoardIDText(device.boardID) {
             appendEvent("Heartbeat unavailable: \(Self.reservedBoardIDMessage)")
         }
@@ -254,6 +285,8 @@ final class ESP32ControllerViewModel: ObservableObject {
         pendingConnectionEndpointDescription = nil
         pendingConnectionDevice = nil
         pendingSelectedEndpointDescription = nil
+        pendingProtocolBoardID = nil
+        connectedProtocolBoardID = nil
         connectedEndpointDescription = nil
         connectedDiscoveredDevice = nil
         discoveryService.updateConnectedEndpointDescription(nil)
@@ -282,6 +315,49 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
     }
 
+    func sendConnectionTest() {
+        sendClockCommand(.connectionTest)
+    }
+
+    func applyClockConfiguration() {
+        let level = UInt8(brightnessLevel.rounded())
+        sendClockCommand(.setConfiguration(format24Hour: is24HourFormat, brightnessLevel: level))
+    }
+
+    func requestClockConfiguration() {
+        sendClockCommand(.readConfiguration)
+    }
+
+    func requestDeviceReset(resetID: UInt8) {
+        sendClockCommand(.reset(resetID: resetID))
+    }
+
+    func sendClockCommand(_ command: ClockProtocolCommand) {
+        guard state == .connected else {
+            commandStatusMessage = "Connect to an ESP32 before sending clock commands."
+            appendEvent(commandStatusMessage ?? "")
+            return
+        }
+
+        do {
+            let bytes = try ClockProtocolEncoder.encode(command, boardID: connectedProtocolBoardID)
+            client.send(Data(bytes)) { [weak self] error in
+                DispatchQueue.main.async {
+                    if let error {
+                        self?.commandStatusMessage = "Send failed: \(error.localizedDescription)"
+                        self?.appendEvent(self?.commandStatusMessage ?? "Send failed")
+                    } else {
+                        self?.commandStatusMessage = "Sent \(command.logLabel)"
+                        self?.appendLog(direction: .outgoing, bytes: bytes, message: command.logLabel)
+                    }
+                }
+            }
+        } catch {
+            commandStatusMessage = error.localizedDescription
+            appendEvent(error.localizedDescription)
+        }
+    }
+
     func clearLog() {
         logEntries.removeAll()
     }
@@ -295,6 +371,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         isExpectingInitialDisconnect = true
         connectedEndpointDescription = nil
         connectedDiscoveredDevice = nil
+        connectedProtocolBoardID = nil
         discoveryService.updateConnectedEndpointDescription(nil)
 
         switch target {
@@ -330,6 +407,8 @@ final class ESP32ControllerViewModel: ObservableObject {
             scannerConnectionErrorText = newState.detail ?? newState.title
             connectedEndpointDescription = nil
             connectedDiscoveredDevice = nil
+            connectedProtocolBoardID = nil
+            pendingProtocolBoardID = nil
             discoveryService.updateConnectedEndpointDescription(nil)
         case .disconnected:
             if isExpectingInitialDisconnect {
@@ -343,6 +422,8 @@ final class ESP32ControllerViewModel: ObservableObject {
             pendingSelectedEndpointDescription = nil
             connectedEndpointDescription = nil
             connectedDiscoveredDevice = nil
+            connectedProtocolBoardID = nil
+            pendingProtocolBoardID = nil
             discoveryService.updateConnectedEndpointDescription(nil)
         }
     }
@@ -362,8 +443,10 @@ final class ESP32ControllerViewModel: ObservableObject {
             discoveryService.stopScan()
         }
 
+        connectedProtocolBoardID = pendingProtocolBoardID
         pendingSelectedEndpointDescription = nil
         pendingConnectionDevice = nil
+        pendingProtocolBoardID = nil
         scannerConnectionErrorText = nil
         discoveryService.updateConnectedEndpointDescription(connectedEndpointDescription)
         connectionAttempt = .connected(target)

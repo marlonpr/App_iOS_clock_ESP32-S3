@@ -103,6 +103,130 @@ struct ESP32ControllerTests {
         #expect(!viewModel.isRefreshingDevices)
     }
 
+    @Test func clockProtocolEncodesConnectionTestForBoardZero() throws {
+        let frame = try ClockProtocolEncoder.encode(.connectionTest, boardID: 0)
+
+        #expect(frame == [0x2F, 0x54, 0x41, 0x00, 0x45, 0x53, 0x5C])
+    }
+
+    @Test func clockProtocolEncodesReadConfigurationForBoardZero() throws {
+        let frame = try ClockProtocolEncoder.encode(.readConfiguration, boardID: 0)
+
+        #expect(frame == [0x2F, 0x54, 0x41, 0x00, 0x52, 0x43, 0x5C])
+    }
+
+    @Test func clockProtocolEncodesSetConfiguration12HourLevelOne() throws {
+        let frame = try ClockProtocolEncoder.encode(
+            .setConfiguration(format24Hour: false, brightnessLevel: 1),
+            boardID: 0
+        )
+
+        #expect(frame == [0x2F, 0x54, 0x41, 0x00, 0x43, 0x54, 0x00, 0x19, 0x5C])
+    }
+
+    @Test func clockProtocolEncodesSetConfiguration24HourLevelTen() throws {
+        let frame = try ClockProtocolEncoder.encode(
+            .setConfiguration(format24Hour: true, brightnessLevel: 10),
+            boardID: 0
+        )
+
+        #expect(frame == [0x2F, 0x54, 0x41, 0x00, 0x43, 0x54, 0x01, 0xFF, 0x5C])
+    }
+
+    @Test func clockProtocolBrightnessLevelFiveConvertsTo127() throws {
+        let frame = try ClockProtocolEncoder.encode(
+            .setConfiguration(format24Hour: true, brightnessLevel: 5),
+            boardID: 0
+        )
+
+        #expect(frame == [0x2F, 0x54, 0x41, 0x00, 0x43, 0x54, 0x01, 0x7F, 0x5C])
+    }
+
+    @Test func clockProtocolRejectsBrightnessZero() {
+        do {
+            _ = try ClockProtocolEncoder.encode(.setConfiguration(format24Hour: true, brightnessLevel: 0), boardID: 0)
+            Issue.record("Brightness 0 should be rejected")
+        } catch {
+            #expect(error as? ClockProtocolEncodingError == .invalidBrightnessLevel)
+        }
+    }
+
+    @Test func clockProtocolRejectsBrightnessEleven() {
+        do {
+            _ = try ClockProtocolEncoder.encode(.setConfiguration(format24Hour: true, brightnessLevel: 11), boardID: 0)
+            Issue.record("Brightness 11 should be rejected")
+        } catch {
+            #expect(error as? ClockProtocolEncodingError == .invalidBrightnessLevel)
+        }
+    }
+
+    @Test func clockProtocolRejectsReservedBoardIDForEveryCommand() {
+        let commands: [ClockProtocolCommand] = [
+            .connectionTest,
+            .readConfiguration,
+            .setConfiguration(format24Hour: true, brightnessLevel: 5),
+            .reset(resetID: 0)
+        ]
+
+        for command in commands {
+            do {
+                _ = try ClockProtocolEncoder.encode(command, boardID: 0x5C)
+                Issue.record("Board ID 92 should be rejected for \(command)")
+            } catch {
+                #expect(error as? ClockProtocolEncodingError == .reservedBoardID)
+            }
+        }
+    }
+
+    @Test func clockProtocolEncodesResetFrame() throws {
+        let frame = try ClockProtocolEncoder.encode(.reset(resetID: 0x03), boardID: 0)
+
+        #expect(frame == [0x2F, 0x54, 0x41, 0x00, 0x52, 0x54, 0x03, 0x5C])
+    }
+
+    @Test func clockProtocolRejectsResetIDDelimiterConflict() {
+        do {
+            _ = try ClockProtocolEncoder.encode(.reset(resetID: 0x5C), boardID: 0)
+            Issue.record("Reset ID 0x5C should be rejected")
+        } catch {
+            #expect(error as? ClockProtocolEncodingError == .delimiterConflict)
+        }
+    }
+
+    @MainActor
+    @Test func guiClockCommandMethodsDoNotSendWhileDisconnected() {
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForConnectionIndicatorTests(recorder: recorder)
+
+        viewModel.sendConnectionTest()
+        viewModel.applyClockConfiguration()
+        viewModel.requestClockConfiguration()
+        viewModel.requestDeviceReset(resetID: 0)
+
+        #expect(recorder.connections.isEmpty)
+        #expect(viewModel.state == .disconnected)
+    }
+
+    @MainActor
+    @Test func guiClockCommandMethodsDoNotSendWithoutValidBoardID() async {
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForConnectionIndicatorTests(recorder: recorder)
+
+        viewModel.manualBoardID = " "
+        viewModel.connect()
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        viewModel.sendConnectionTest()
+        viewModel.applyClockConfiguration()
+        viewModel.requestClockConfiguration()
+        viewModel.requestDeviceReset(resetID: 0)
+
+        #expect(viewModel.state == .connected)
+        #expect(recorder.connections[0].sendCallCount == 0)
+    }
+
     @MainActor
     @Test func openingScannerStartsExactlyOneBrowser() async {
         var browserCount = 0
