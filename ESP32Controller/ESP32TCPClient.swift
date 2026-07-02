@@ -41,9 +41,9 @@ final class ESP32TCPClient {
     typealias EndpointConnectionFactory = (NWEndpoint) -> TCPConnection
     typealias HeartbeatScheduler = (TimeInterval, @escaping @Sendable () -> Void) -> CancellableTask
 
-    static let defaultPort: UInt16 = 5000
-    static let frameDelimiter: UInt8 = 0x5C
-    static let reservedBoardID: UInt8 = frameDelimiter
+    nonisolated static let defaultPort: UInt16 = 5000
+    nonisolated static let frameDelimiter: UInt8 = 0x5C
+    nonisolated static let reservedBoardID: UInt8 = frameDelimiter
     nonisolated static let defaultHeartbeatConfiguration = HeartbeatConfiguration(
         interval: 12,
         ackTimeout: 4,
@@ -70,6 +70,9 @@ final class ESP32TCPClient {
     private var missedHeartbeatCount = 0
     private var heartbeatLoopTask: CancellableTask?
     private var heartbeatACKTimeoutTask: CancellableTask?
+    private var foregroundValidationTimeoutTask: CancellableTask?
+    private var foregroundValidationSequence: UInt8?
+    private var foregroundValidationCompletion: ((Bool) -> Void)?
     private var isHeartbeatEnabledForActiveConnection = false
 
     init(
@@ -182,6 +185,61 @@ final class ESP32TCPClient {
                 }
 
                 completion(error)
+            }
+        })
+    }
+
+    func validateActiveConnectionWithHeartbeat(
+        timeout: TimeInterval,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard
+            let connection,
+            let connectionID = activeConnectionID,
+            isActiveConnection(connectionID, connection: connection),
+            isHeartbeatEnabledForActiveConnection,
+            let boardID
+        else {
+            completion(false)
+            return
+        }
+
+        stopHeartbeat()
+
+        let sequence = heartbeatSequence
+        heartbeatSequence &+= 1
+
+        guard let frame = Self.heartbeatRequestFrame(boardID: boardID, sequence: sequence) else {
+            completion(false)
+            return
+        }
+
+        awaitingHeartbeatSequence = sequence
+        foregroundValidationSequence = sequence
+        foregroundValidationCompletion = completion
+        publishHealth(.waitingForACK)
+        scheduleForegroundValidationTimeout(
+            for: connectionID,
+            connection: connection,
+            sequence: sequence,
+            timeout: timeout
+        )
+
+        let callbackContext = ConnectionCallbackContext(connectionID: connectionID, connection: connection)
+        connection.send(content: Data(frame), contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { error in
+            Task { @MainActor [weak self, callbackContext] in
+                guard
+                    let self,
+                    let connection = callbackContext.connection,
+                    self.isActiveConnection(callbackContext.connectionID, connection: connection),
+                    self.foregroundValidationSequence == sequence
+                else {
+                    return
+                }
+
+                if error != nil {
+                    self.completeForegroundValidation(success: false)
+                }
             }
         })
     }
@@ -448,6 +506,31 @@ final class ESP32TCPClient {
         }
     }
 
+    private func scheduleForegroundValidationTimeout(
+        for connectionID: UUID,
+        connection: TCPConnection,
+        sequence: UInt8,
+        timeout: TimeInterval
+    ) {
+        foregroundValidationTimeoutTask?.cancel()
+        let callbackContext = ConnectionCallbackContext(connectionID: connectionID, connection: connection)
+        foregroundValidationTimeoutTask = heartbeatACKTimeoutScheduler(timeout) { [weak self, callbackContext] in
+            Task { @MainActor [weak self, callbackContext] in
+                guard
+                    let self,
+                    let connection = callbackContext.connection,
+                    self.isActiveConnection(callbackContext.connectionID, connection: connection),
+                    self.foregroundValidationSequence == sequence,
+                    self.awaitingHeartbeatSequence == sequence
+                else {
+                    return
+                }
+
+                self.completeForegroundValidation(success: false)
+            }
+        }
+    }
+
     private func handleHeartbeatACKFrame(_ frame: [UInt8]) -> Bool {
         guard
             isHeartbeatEnabledForActiveConnection,
@@ -463,10 +546,41 @@ final class ESP32TCPClient {
 
         heartbeatACKTimeoutTask?.cancel()
         heartbeatACKTimeoutTask = nil
+        foregroundValidationTimeoutTask?.cancel()
+        foregroundValidationTimeoutTask = nil
         awaitingHeartbeatSequence = nil
         missedHeartbeatCount = 0
         publishHealth(.healthy)
+
+        if foregroundValidationSequence == sequence {
+            foregroundValidationSequence = nil
+            let completion = foregroundValidationCompletion
+            foregroundValidationCompletion = nil
+            if
+                let activeConnectionID,
+                let connection,
+                isActiveConnection(activeConnectionID, connection: connection)
+            {
+                startHeartbeat(for: activeConnectionID, connection: connection)
+            }
+            completion?(true)
+        }
+
         return true
+    }
+
+    private func completeForegroundValidation(success: Bool) {
+        guard foregroundValidationCompletion != nil else {
+            return
+        }
+
+        foregroundValidationTimeoutTask?.cancel()
+        foregroundValidationTimeoutTask = nil
+        foregroundValidationSequence = nil
+        awaitingHeartbeatSequence = nil
+        let completion = foregroundValidationCompletion
+        foregroundValidationCompletion = nil
+        completion?(success)
     }
 
     private func stopHeartbeat() {
@@ -474,6 +588,10 @@ final class ESP32TCPClient {
         heartbeatLoopTask = nil
         heartbeatACKTimeoutTask?.cancel()
         heartbeatACKTimeoutTask = nil
+        foregroundValidationTimeoutTask?.cancel()
+        foregroundValidationTimeoutTask = nil
+        foregroundValidationSequence = nil
+        foregroundValidationCompletion = nil
         awaitingHeartbeatSequence = nil
         missedHeartbeatCount = 0
     }

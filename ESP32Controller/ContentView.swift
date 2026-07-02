@@ -5,11 +5,16 @@
 //  Created by Marlon Pérez on 22/06/26.
 //
 
+import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var viewModel = ESP32ControllerViewModel()
+    @Environment(\.scenePhase) private var scenePhase
     @State private var isAdvancedDiagnosticsExpanded = false
+    @State private var selectedLogoPhotoItem: PhotosPickerItem?
+    @State private var isPNGFileImporterPresented = false
     @FocusState private var focusedField: FocusedField?
 
     var body: some View {
@@ -45,14 +50,56 @@ struct ContentView: View {
                     Text("ESP32 Devices")
                 }
 
-                Section("Clock Controls") {
-                    Button("Apply Settings") {
-                        dismissKeyboard()
-                        viewModel.applyClockConfiguration()
+                Section("Logo") {
+                    PhotosPicker(
+                        selection: $selectedLogoPhotoItem,
+                        matching: .images,
+                        preferredItemEncoding: .current
+                    ) {
+                        Label("Choose Photo", systemImage: "photo")
                     }
-                    .disabled(!viewModel.canUseClockControls)
 
-                    Picker("Time Format", selection: $viewModel.is24HourFormat) {
+                    LogoPreviewView(previewImage: viewModel.processedLogoPreview)
+
+                    Button("Upload Logo") {
+                        dismissKeyboard()
+                        viewModel.uploadLogo()
+                    }
+                    .disabled(!viewModel.canUploadLogo)
+
+                    Button("Restore Default Logo") {
+                        dismissKeyboard()
+                        viewModel.presentRestoreDefaultLogoConfirmation()
+                    }
+                    .disabled(!viewModel.canRestoreDefaultLogo)
+                }
+
+                Section("Clock Controls") {
+                    Button("Sync Time") {
+                        dismissKeyboard()
+                        viewModel.syncDeviceTime()
+                    }
+                    .accessibilityLabel("Sync Time")
+                    .accessibilityHint("Sets the ESP32 clock to the current date and time from this iPhone.")
+                    .accessibilityValue(viewModel.timeSyncState.isConfirmationPending ? "Synchronizing" : "")
+                    .disabled(!viewModel.canSyncTime)
+
+                    Button("Next Display Mode") {
+                        dismissKeyboard()
+                        viewModel.requestNextDisplayMode()
+                    }
+                    .accessibilityLabel("Next Display Mode")
+                    .accessibilityHint("Advances the ESP32 clock display to the next mode.")
+                    .accessibilityValue(viewModel.displayModeChangeState.isConfirmationPending ? "Changing" : "")
+                    .disabled(!viewModel.canRequestNextDisplayMode)
+
+                    Picker("Time Format", selection: Binding(
+                        get: { viewModel.is24HourFormat },
+                        set: { newValue in
+                            dismissKeyboard()
+                            viewModel.userSelectedTimeFormat(newValue)
+                        }
+                    )) {
                         Text("12 Hour").tag(false)
                         Text("24 Hour").tag(true)
                     }
@@ -68,7 +115,17 @@ struct ContentView: View {
                                 .foregroundStyle(.secondary)
                         }
 
-                        Slider(value: $viewModel.brightnessLevel, in: 1...10, step: 1)
+                        Slider(
+                            value: $viewModel.brightnessLevel,
+                            in: 1...10,
+                            step: 1,
+                            onEditingChanged: { isEditing in
+                                if isEditing {
+                                    dismissKeyboard()
+                                }
+                                viewModel.brightnessEditingChanged(isEditing)
+                            }
+                        )
                             .disabled(!viewModel.canUseClockControls)
                     }
 
@@ -84,7 +141,8 @@ struct ContentView: View {
                     AdvancedDiagnosticsContent(
                         viewModel: viewModel,
                         focusedField: $focusedField,
-                        dismissKeyboard: dismissKeyboard
+                        dismissKeyboard: dismissKeyboard,
+                        presentPNGImporter: presentLogoPNGFileImporter
                     )
                 }
                 .accessibilityLabel("Advanced / Diagnostics")
@@ -108,7 +166,138 @@ struct ContentView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This will send the device default-configuration command to the connected ESP32.")
+                Text(ESP32ControllerViewModel.deviceDefaultConfigurationConfirmationMessage)
+            }
+            .alert(
+                "Restore Default Logo?",
+                isPresented: $viewModel.isRestoreDefaultLogoConfirmationPresented
+            ) {
+                Button("Cancel", role: .cancel) {}
+                Button("Restore", role: .destructive) {
+                    dismissKeyboard()
+                    viewModel.restoreDefaultLogo()
+                }
+            } message: {
+                Text(ESP32ControllerViewModel.defaultLogoRestoreConfirmationMessage)
+            }
+            .alert(
+                "Time Synchronized",
+                isPresented: Binding(
+                    get: { viewModel.isTimeSyncSuccessAlertPresented },
+                    set: { isPresented in
+                        if !isPresented {
+                            viewModel.dismissTimeSyncSuccessAlert()
+                        }
+                    }
+                )
+            ) {
+                Button("OK") {
+                    viewModel.dismissTimeSyncSuccessAlert()
+                }
+            } message: {
+                Text("Time synchronized successfully.")
+            }
+            .alert(
+                "Display Mode Changed",
+                isPresented: Binding(
+                    get: { viewModel.isDisplayModeSuccessAlertPresented },
+                    set: { isPresented in
+                        if !isPresented {
+                            viewModel.dismissDisplayModeSuccessAlert()
+                        }
+                    }
+                )
+            ) {
+                Button("OK") {
+                    viewModel.dismissDisplayModeSuccessAlert()
+                }
+            } message: {
+                Text("Display mode changed to Mode \(viewModel.confirmedDisplayMode ?? 0).")
+            }
+            .alert(
+                "Logo Updated",
+                isPresented: Binding(
+                    get: { viewModel.isLogoUploadSuccessAlertPresented },
+                    set: { isPresented in
+                        if !isPresented {
+                            viewModel.dismissLogoUploadSuccessAlert()
+                        }
+                    }
+                )
+            ) {
+                Button("OK") {
+                    viewModel.dismissLogoUploadSuccessAlert()
+                }
+            } message: {
+                Text("The new logo was saved and activated successfully.")
+            }
+            .alert(
+                "Default Logo Restored",
+                isPresented: Binding(
+                    get: { viewModel.isDefaultLogoRestoreSuccessAlertPresented },
+                    set: { isPresented in
+                        if !isPresented {
+                            viewModel.dismissDefaultLogoRestoreSuccessAlert()
+                        }
+                    }
+                )
+            ) {
+                Button("OK") {
+                    viewModel.dismissDefaultLogoRestoreSuccessAlert()
+                }
+            } message: {
+                Text(ESP32ControllerViewModel.defaultLogoRestoreSuccessMessage)
+            }
+            .fileImporter(
+                isPresented: $isPNGFileImporterPresented,
+                allowedContentTypes: [.png],
+                allowsMultipleSelection: false
+            ) { result in
+                handleLogoPNGFileImport(result)
+            }
+            .onChange(of: selectedLogoPhotoItem) { _, newItem in
+                guard let newItem else {
+                    return
+                }
+
+                let selectionID = viewModel.beginLogoPhotoSelection()
+                Task {
+                    do {
+                        guard let data = try await newItem.loadTransferable(type: Data.self) else {
+                            await MainActor.run {
+                                viewModel.failLogoPhotoSelection("Unable to load the selected photo.", selectionID: selectionID)
+                            }
+                            return
+                        }
+
+                        await MainActor.run {
+                            viewModel.convertSelectedLogoImage(
+                                data,
+                                selectionID: selectionID,
+                                source: .photos
+                            )
+                        }
+                    } catch {
+                        await MainActor.run {
+                            viewModel.failLogoPhotoSelection(error.localizedDescription, selectionID: selectionID)
+                        }
+                    }
+                }
+            }
+            .onAppear {
+                viewModel.handleAppBecameActive()
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                switch newPhase {
+                case .active:
+                    viewModel.handleAppBecameActive()
+                case .inactive:
+                    viewModel.handleAppBecameInactive()
+                case .background:
+                    viewModel.handleAppEnteredBackground()
+                @unknown default:
+                    viewModel.handleAppBecameInactive()
+                }
             }
             .onDisappear {
                 viewModel.stopDiscovery()
@@ -121,6 +310,198 @@ struct ContentView: View {
 
     private func dismissKeyboard() {
         focusedField = nil
+    }
+
+    private func presentLogoPNGFileImporter() {
+        dismissKeyboard()
+        isPNGFileImporterPresented = true
+    }
+
+    private func handleLogoPNGFileImport(_ result: Result<[URL], Error>) {
+        guard case let .success(urls) = result, let url = urls.first else {
+            return
+        }
+
+        let selectionID = viewModel.beginLogoFileSelection()
+        Task {
+            do {
+                let data = try readLogoPNGFileData(from: url)
+                _ = try LogoImageConverter.validateLosslessPNGData(data)
+                await MainActor.run {
+                    viewModel.convertSelectedLogoImage(
+                        data,
+                        selectionID: selectionID,
+                        source: .files
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    viewModel.failLogoFileSelection(error.localizedDescription, selectionID: selectionID)
+                }
+            }
+        }
+    }
+
+    private func readLogoPNGFileData(from url: URL) throws -> Data {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessed {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        return try Data(contentsOf: url)
+    }
+}
+
+private struct LogoPreviewView: View {
+    let previewImage: CGImage?
+
+    var body: some View {
+        ZStack {
+            Color.black
+
+            if let previewImage {
+                Image(decorative: previewImage, scale: 1, orientation: .up)
+                    .interpolation(.none)
+                    .resizable()
+                    .aspectRatio(2, contentMode: .fit)
+            }
+        }
+        .aspectRatio(2, contentMode: .fit)
+        .frame(maxWidth: 256)
+        .accessibilityLabel("Processed logo preview")
+    }
+}
+
+private struct LogoUploadStatusView: View {
+    let state: LogoUploadState
+
+    var body: some View {
+        HStack(spacing: 8) {
+            switch state {
+            case .idle:
+                Text("Idle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .converting:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Converting")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .ready:
+                Text("Ready")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .connecting:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Connecting")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .waitingForReady:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Waiting for READY")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case let .uploading(progress):
+                ProgressView(value: progress)
+                Text("\(Int((progress * 100).rounded()))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            case .waitingForConfirmation:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Waiting for OK")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .succeeded:
+                Text("Updated")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case let .failed(message):
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(minHeight: 20, alignment: .leading)
+    }
+}
+
+private struct TimeSyncStatusView: View {
+    let state: TimeSyncState
+
+    var body: some View {
+        HStack(spacing: 8) {
+            switch state {
+            case .idle:
+                Text("Idle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .sending:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Sending time synchronization command...")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .waitingForConfirmation:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Waiting for device confirmation...")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .succeeded:
+                EmptyView()
+            case let .failed(message):
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(minHeight: 20, alignment: .leading)
+    }
+}
+
+private struct DisplayModeStatusView: View {
+    let state: DisplayModeChangeState
+
+    var body: some View {
+        HStack(spacing: 8) {
+            switch state {
+            case .idle:
+                Text("Idle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .sending:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Sending display mode command...")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .waitingForConfirmation:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Waiting for device confirmation...")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .succeeded:
+                EmptyView()
+            case let .failed(message):
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(minHeight: 20, alignment: .leading)
     }
 }
 
@@ -171,6 +552,7 @@ private struct AdvancedDiagnosticsContent: View {
     @ObservedObject var viewModel: ESP32ControllerViewModel
     let focusedField: FocusState<FocusedField?>.Binding
     let dismissKeyboard: () -> Void
+    let presentPNGImporter: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -189,6 +571,30 @@ private struct AdvancedDiagnosticsContent: View {
             deviceDiagnostics
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Device Diagnostics")
+
+            Divider()
+
+            appLifecycleDiagnostics
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("App Lifecycle Diagnostics")
+
+            Divider()
+
+            timeSynchronizationStatus
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Time Synchronization Status")
+
+            Divider()
+
+            displayModeStatus
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Display Mode Status")
+
+            Divider()
+
+            logoDiagnostics
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Logo Diagnostics")
 
             Divider()
 
@@ -264,6 +670,65 @@ private struct AdvancedDiagnosticsContent: View {
         }
     }
 
+    private var logoDiagnostics: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Logo Diagnostics")
+                .font(.headline)
+
+            if let diagnostics = viewModel.logoSourceDiagnostics {
+                LabeledContent("Source Format") {
+                    Text(diagnostics.sourceDisplayName)
+                }
+
+                LabeledContent("Source Dimensions") {
+                    Text(diagnostics.dimensionsDisplayText)
+                }
+
+                LabeledContent("Conversion") {
+                    Text(diagnostics.conversionDisplayName)
+                }
+
+                if let warning = viewModel.logoSourceCompressionWarning {
+                    Label {
+                        Text(warning)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+            } else {
+                Text("No logo source selected.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            LogoUploadStatusView(state: viewModel.logoUploadState)
+
+            LabeledContent("Logo Service") {
+                Text(viewModel.logoServiceDiagnosticsText)
+            }
+
+            LabeledContent("Logo Endpoint Source") {
+                Text(viewModel.logoEndpointSourceDiagnosticsText)
+            }
+
+            LabeledContent("Logo Destination") {
+                Text(viewModel.logoDestinationDiagnosticsText)
+            }
+
+            Text("Default Logo Restore: \(viewModel.defaultLogoRestoreDiagnosticsText)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Button("Import Lossless PNG File") {
+                dismissKeyboard()
+                presentPNGImporter()
+            }
+        }
+    }
+
     private var deviceDiagnostics: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Device Diagnostics")
@@ -272,6 +737,12 @@ private struct AdvancedDiagnosticsContent: View {
             Button("Read Configuration") {
                 dismissKeyboard()
                 viewModel.requestClockConfiguration()
+            }
+            .disabled(!viewModel.canUseClockControls)
+
+            Button("Send Current Settings") {
+                dismissKeyboard()
+                viewModel.sendCurrentClockConfiguration()
             }
             .disabled(!viewModel.canUseClockControls)
 
@@ -286,6 +757,59 @@ private struct AdvancedDiagnosticsContent: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private var appLifecycleDiagnostics: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("App Lifecycle")
+                .font(.headline)
+
+            LabeledContent("App Phase") {
+                Text(viewModel.appPhaseDiagnosticsText)
+            }
+
+            LabeledContent("Last Device") {
+                Text(viewModel.lastDeviceDiagnosticsText)
+            }
+
+            LabeledContent("Auto Reconnect") {
+                Text(viewModel.autoReconnectDiagnosticsText)
+            }
+
+            LabeledContent("Resume Action") {
+                Text(viewModel.resumeActionDiagnosticsText)
+            }
+
+            LabeledContent("Reconnect Attempt") {
+                Text(viewModel.reconnectAttemptDiagnosticsText)
+            }
+
+            LabeledContent("Endpoint Source") {
+                Text(viewModel.endpointSourceDiagnosticsText)
+            }
+
+            LabeledContent("Foreground Validation") {
+                Text(viewModel.foregroundValidationDiagnosticsText)
+            }
+        }
+    }
+
+    private var timeSynchronizationStatus: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Time Synchronization Status")
+                .font(.headline)
+
+            TimeSyncStatusView(state: viewModel.timeSyncState)
+        }
+    }
+
+    private var displayModeStatus: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Display Mode Status")
+                .font(.headline)
+
+            DisplayModeStatusView(state: viewModel.displayModeChangeState)
         }
     }
 

@@ -39,7 +39,45 @@ struct DiscoveredESP32: Identifiable, Equatable {
     let model: String?
     let protocolVersion: String?
     let firmwareVersion: String?
-    var livenessState: ESP32LivenessState = .unknown
+    let serviceType: String?
+    let serviceDomain: String?
+    let hostname: String?
+    let controlPort: UInt16?
+    var logoEndpoint: NWEndpoint?
+    var logoUploadEndpoint: DiscoveredLogoUploadEndpoint?
+    var livenessState: ESP32LivenessState
+
+    init(
+        id: String,
+        serviceName: String,
+        endpoint: NWEndpoint,
+        boardID: String?,
+        model: String?,
+        protocolVersion: String?,
+        firmwareVersion: String?,
+        serviceType: String? = nil,
+        serviceDomain: String? = nil,
+        hostname: String? = nil,
+        controlPort: UInt16? = nil,
+        logoEndpoint: NWEndpoint? = nil,
+        logoUploadEndpoint: DiscoveredLogoUploadEndpoint? = nil,
+        livenessState: ESP32LivenessState = .unknown
+    ) {
+        self.id = id
+        self.serviceName = serviceName
+        self.endpoint = endpoint
+        self.boardID = boardID
+        self.model = model
+        self.protocolVersion = protocolVersion
+        self.firmwareVersion = firmwareVersion
+        self.serviceType = serviceType
+        self.serviceDomain = serviceDomain
+        self.hostname = hostname
+        self.controlPort = controlPort
+        self.logoEndpoint = logoEndpoint
+        self.logoUploadEndpoint = logoUploadEndpoint
+        self.livenessState = livenessState
+    }
 
     var stableEndpointDescription: String {
         String(describing: endpoint)

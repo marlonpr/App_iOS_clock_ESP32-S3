@@ -96,6 +96,16 @@ struct ESP32BrowseResult {
     let metadata: NWBrowser.Result.Metadata
 }
 
+struct DiscoveredLogoUploadEndpoint: Equatable {
+    let boardID: UInt8
+    let endpoint: NWEndpoint
+    let serviceName: String?
+    let serviceType: String?
+    let serviceDomain: String?
+    let hostname: String?
+    let port: UInt16?
+}
+
 @MainActor
 final class ESP32DiscoveryService: ObservableObject {
     typealias BrowserFactory = () -> ESP32Browsing
@@ -104,6 +114,7 @@ final class ESP32DiscoveryService: ObservableObject {
     typealias InitialResultSettleScheduler = (@escaping @Sendable () -> Void) -> CancellableTask
 
     nonisolated static let serviceType = "_espclock._tcp"
+    nonisolated static let logoServiceType = "_espclock-logo._tcp"
     nonisolated static let probeTimeoutSeconds = 2.0
     nonisolated static let initialResultSettleSeconds = 0.5
     private static let maxConcurrentProbes = 2
@@ -111,18 +122,22 @@ final class ESP32DiscoveryService: ObservableObject {
     @Published private(set) var state: ESP32DiscoveryState = .stopped
     @Published private(set) var scannerState: ESP32ScannerState = .idle
     @Published private(set) var devices: [DiscoveredESP32] = []
+    @Published private(set) var logoUploadEndpoints: [DiscoveredLogoUploadEndpoint] = []
     @Published private(set) var errorText: String?
     @Published private(set) var isRefreshing = false
 
     private let queue = DispatchQueue(label: "ESP32Controller.Discovery")
     private let browserFactory: BrowserFactory
+    private let logoBrowserFactory: BrowserFactory
     private let probeConnectionFactory: ProbeConnectionFactory
     private let timeoutScheduler: TimeoutScheduler
     private let initialResultSettleScheduler: InitialResultSettleScheduler
     private var browser: ESP32Browsing?
+    private var logoBrowser: ESP32Browsing?
     private var activeRefreshID: UUID?
     private var connectedEndpointDescription: String?
     private var browsedDevicesByEndpoint: [String: DiscoveredESP32] = [:]
+    private var logoEndpointsByBoardID: [UInt8: DiscoveredLogoUploadEndpoint] = [:]
     private var probesByEndpoint: [String: ActiveProbe] = [:]
     private var pendingProbeEndpointDescriptions: [String] = []
     private var probeEndpointsByDescription: [String: NWEndpoint] = [:]
@@ -135,6 +150,15 @@ final class ESP32DiscoveryService: ObservableObject {
             NWBrowser(
                 for: .bonjourWithTXTRecord(
                     type: ESP32DiscoveryService.serviceType,
+                    domain: nil
+                ),
+                using: .tcp
+            )
+        },
+        logoBrowserFactory: @escaping BrowserFactory = {
+            NWBrowser(
+                for: .bonjourWithTXTRecord(
+                    type: ESP32DiscoveryService.logoServiceType,
                     domain: nil
                 ),
                 using: .tcp
@@ -155,6 +179,7 @@ final class ESP32DiscoveryService: ObservableObject {
         }
     ) {
         self.browserFactory = browserFactory
+        self.logoBrowserFactory = logoBrowserFactory
         self.probeConnectionFactory = probeConnectionFactory
         self.timeoutScheduler = timeoutScheduler
         self.initialResultSettleScheduler = initialResultSettleScheduler
@@ -181,21 +206,53 @@ final class ESP32DiscoveryService: ObservableObject {
         beginDeviceScan(connectedEndpointDescription: connectedEndpointDescription)
     }
 
+    func resumeDiscoveryPreservingCache(connectedEndpointDescription: String? = nil) {
+        beginDeviceScan(connectedEndpointDescription: connectedEndpointDescription, clearExistingDevices: false)
+    }
+
+    func pauseDiscoveryPreservingCache() {
+        cancelActiveRefresh(clearCachedDevices: false)
+        errorText = nil
+        isRefreshing = false
+        state = .stopped
+        scannerState = .idle
+    }
+
     func beginDeviceScan(connectedEndpointDescription: String? = nil) {
-        cancelActiveRefresh()
+        beginDeviceScan(connectedEndpointDescription: connectedEndpointDescription, clearExistingDevices: true)
+    }
+
+    private func beginDeviceScan(connectedEndpointDescription: String? = nil, clearExistingDevices: Bool) {
+        cancelActiveRefresh(clearCachedDevices: clearExistingDevices)
 
         let refreshID = UUID()
         let browser = browserFactory()
+        let logoBrowser = logoBrowserFactory()
         activeRefreshID = refreshID
         self.browser = browser
+        self.logoBrowser = logoBrowser
         self.connectedEndpointDescription = connectedEndpointDescription
-        browsedDevicesByEndpoint.removeAll()
+        if clearExistingDevices {
+            browsedDevicesByEndpoint.removeAll()
+            logoEndpointsByBoardID.removeAll()
+            logoUploadEndpoints = []
+        }
         hasProcessedBrowseResultsForRefresh = false
         errorText = nil
         isRefreshing = true
         state = .refreshing
         scannerState = .scanning
-        devices = []
+        if clearExistingDevices {
+            devices = []
+        } else {
+            for index in devices.indices {
+                if devices[index].stableEndpointDescription == connectedEndpointDescription {
+                    devices[index].livenessState = .connected
+                } else if devices[index].livenessState == .checking {
+                    devices[index].livenessState = .unknown
+                }
+            }
+        }
 
         browser.stateUpdateHandler = { [weak self, weak browser] state in
             Task { @MainActor [weak self, weak browser] in
@@ -221,7 +278,32 @@ final class ESP32DiscoveryService: ObservableObject {
             }
         }
 
+        logoBrowser.stateUpdateHandler = { [weak self, weak logoBrowser] state in
+            Task { @MainActor [weak self, weak logoBrowser] in
+                guard let logoBrowser else {
+                    return
+                }
+
+                self?.handleLogoBrowserState(state, refreshID: refreshID, browser: logoBrowser)
+            }
+        }
+
+        logoBrowser.browseResultsChangedHandler = { [weak self, weak logoBrowser] results, _ in
+            let browseResults = results.map {
+                ESP32BrowseResult(endpoint: $0.endpoint, metadata: $0.metadata)
+            }
+
+            Task { @MainActor [weak self, weak logoBrowser] in
+                guard let logoBrowser else {
+                    return
+                }
+
+                self?.applyLogoBrowseResults(browseResults, refreshID: refreshID, browser: logoBrowser)
+            }
+        }
+
         browser.start(queue: queue)
+        logoBrowser.start(queue: queue)
     }
 
     func stopScan() {
@@ -247,6 +329,7 @@ final class ESP32DiscoveryService: ObservableObject {
         var devicesByID: [String: DiscoveredESP32] = [:]
         for result in results {
             var device = Self.device(from: result)
+            attachLogoEndpoint(to: &device)
             updateLivenessForCurrentConnection(device: &device)
             devicesByID[device.id] = device
         }
@@ -273,6 +356,14 @@ final class ESP32DiscoveryService: ObservableObject {
         }
 
         applyBrowseResults(results, refreshID: activeRefreshID, browser: browser)
+    }
+
+    func applyLogoBrowseResultsForTesting(_ results: [ESP32BrowseResult], browser: ESP32Browsing) {
+        guard let activeRefreshID else {
+            return
+        }
+
+        applyLogoBrowseResults(results, refreshID: activeRefreshID, browser: browser)
     }
 
     func updateConnectedEndpointDescription(_ endpointDescription: String?) {
@@ -319,6 +410,7 @@ final class ESP32DiscoveryService: ObservableObject {
             cancelAllProbes()
             self.browser = nil
             activeRefreshID = nil
+            cancelLogoBrowserAndClearEndpoints()
             isRefreshing = false
             state = .failed(text)
             scannerState = .failed(text)
@@ -333,6 +425,7 @@ final class ESP32DiscoveryService: ObservableObject {
                 errorText = nil
                 self.browser = nil
                 activeRefreshID = nil
+                cancelLogoBrowserAndClearEndpoints()
                 isRefreshing = false
             }
         @unknown default:
@@ -341,6 +434,7 @@ final class ESP32DiscoveryService: ObservableObject {
             cancelAllProbes()
             self.browser = nil
             activeRefreshID = nil
+            cancelLogoBrowserAndClearEndpoints()
             isRefreshing = false
             state = .failed(text)
             scannerState = .failed(text)
@@ -348,25 +442,91 @@ final class ESP32DiscoveryService: ObservableObject {
         }
     }
 
+    private func handleLogoBrowserState(
+        _ browserState: NWBrowser.State,
+        refreshID: UUID,
+        browser: ESP32Browsing
+    ) {
+        guard isActiveLogoBrowser(refreshID, browser: browser) else {
+            return
+        }
+
+        switch browserState {
+        case .setup, .ready, .waiting:
+            break
+        case .failed, .cancelled:
+            cancelLogoBrowserAndClearEndpoints()
+        @unknown default:
+            cancelLogoBrowserAndClearEndpoints()
+        }
+    }
+
+    private func applyLogoBrowseResults(
+        _ results: [ESP32BrowseResult],
+        refreshID: UUID,
+        browser: ESP32Browsing
+    ) {
+        guard isActiveLogoBrowser(refreshID, browser: browser) else {
+            return
+        }
+
+        var endpointsByBoardID: [UInt8: DiscoveredLogoUploadEndpoint] = [:]
+        for result in results {
+            guard let endpoint = Self.logoUploadEndpoint(from: result) else {
+                continue
+            }
+
+            endpointsByBoardID[endpoint.boardID] = endpoint
+        }
+
+        logoEndpointsByBoardID = endpointsByBoardID
+        logoUploadEndpoints = Self.sortLogoEndpoints(Array(endpointsByBoardID.values))
+        refreshLogoEndpointAssociations()
+    }
+
     private func isActiveBrowser(_ refreshID: UUID, browser: ESP32Browsing) -> Bool {
         activeRefreshID == refreshID && self.browser === browser
+    }
+
+    private func isActiveLogoBrowser(_ refreshID: UUID, browser: ESP32Browsing) -> Bool {
+        activeRefreshID == refreshID && logoBrowser === browser
     }
 
     private func isActiveRefresh(_ refreshID: UUID) -> Bool {
         activeRefreshID == refreshID
     }
 
-    private func cancelActiveRefresh() {
+    private func cancelActiveRefresh(clearCachedDevices: Bool = true) {
         let browserToCancel = browser
+        let logoBrowserToCancel = logoBrowser
         cancelInitialResultSettleTask()
         activeRefreshID = nil
         browser = nil
+        logoBrowser = nil
         browserToCancel?.stateUpdateHandler = nil
         browserToCancel?.browseResultsChangedHandler = nil
         browserToCancel?.cancel()
+        logoBrowserToCancel?.stateUpdateHandler = nil
+        logoBrowserToCancel?.browseResultsChangedHandler = nil
+        logoBrowserToCancel?.cancel()
         cancelAllProbes()
-        browsedDevicesByEndpoint.removeAll()
+        if clearCachedDevices {
+            browsedDevicesByEndpoint.removeAll()
+            logoEndpointsByBoardID.removeAll()
+            logoUploadEndpoints = []
+        }
         hasProcessedBrowseResultsForRefresh = false
+    }
+
+    private func cancelLogoBrowserAndClearEndpoints() {
+        let logoBrowserToCancel = logoBrowser
+        logoBrowser = nil
+        logoBrowserToCancel?.stateUpdateHandler = nil
+        logoBrowserToCancel?.browseResultsChangedHandler = nil
+        logoBrowserToCancel?.cancel()
+        logoEndpointsByBoardID.removeAll()
+        logoUploadEndpoints = []
+        refreshLogoEndpointAssociations()
     }
 
     private func startInitialResultSettleTask(refreshID: UUID) {
@@ -605,6 +765,33 @@ final class ESP32DiscoveryService: ObservableObject {
         devices = Self.sortDevices(devices)
     }
 
+    private func attachLogoEndpoint(to device: inout DiscoveredESP32) {
+        guard let boardID = Self.strictTXTBoardIDByte(from: device.boardID) else {
+            device.logoEndpoint = nil
+            device.logoUploadEndpoint = nil
+            return
+        }
+
+        let logoUploadEndpoint = logoEndpointsByBoardID[boardID]
+        device.logoUploadEndpoint = logoUploadEndpoint
+        device.logoEndpoint = logoUploadEndpoint?.endpoint
+    }
+
+    private func refreshLogoEndpointAssociations() {
+        for endpointDescription in Array(browsedDevicesByEndpoint.keys) {
+            guard var device = browsedDevicesByEndpoint[endpointDescription] else {
+                continue
+            }
+
+            attachLogoEndpoint(to: &device)
+            browsedDevicesByEndpoint[endpointDescription] = device
+        }
+
+        for index in devices.indices {
+            attachLogoEndpoint(to: &devices[index])
+        }
+    }
+
     private func cancelProbesForRemovedEndpoints(remainingEndpointDescriptions: Set<String>) {
         for endpointDescription in Array(probesByEndpoint.keys) where !remainingEndpointDescriptions.contains(endpointDescription) {
             cancelProbe(endpointDescription: endpointDescription)
@@ -665,6 +852,7 @@ final class ESP32DiscoveryService: ObservableObject {
         let txt = txtValues(from: result.metadata)
         let serviceName = serviceInstanceName(from: result.endpoint) ?? result.endpoint.debugDescription
         let stableEndpointDescription = String(describing: result.endpoint)
+        let serviceMetadata = serviceEndpointMetadata(from: result.endpoint)
 
         return DiscoveredESP32(
             id: stableEndpointDescription,
@@ -674,8 +862,55 @@ final class ESP32DiscoveryService: ObservableObject {
             model: txt["model"],
             protocolVersion: txt["protocol"],
             firmwareVersion: txt["firmware"],
+            serviceType: serviceMetadata?.type,
+            serviceDomain: serviceMetadata?.domain,
+            hostname: txt["hostname"] ?? txt["host"],
+            controlPort: ESP32TCPClient.defaultPort,
+            logoEndpoint: nil,
             livenessState: .unknown
         )
+    }
+
+    nonisolated static func logoUploadEndpoint(from result: ESP32BrowseResult) -> DiscoveredLogoUploadEndpoint? {
+        let txt = txtValues(from: result.metadata)
+        guard let boardID = strictTXTBoardIDByte(from: txt["id"]) else {
+            return nil
+        }
+        let serviceMetadata = serviceEndpointMetadata(from: result.endpoint)
+
+        return DiscoveredLogoUploadEndpoint(
+            boardID: boardID,
+            endpoint: result.endpoint,
+            serviceName: serviceMetadata?.name,
+            serviceType: serviceMetadata?.type ?? logoServiceType,
+            serviceDomain: serviceMetadata?.domain,
+            hostname: txt["hostname"] ?? txt["host"],
+            port: port(from: result.endpoint)
+        )
+    }
+
+    nonisolated static func port(from endpoint: NWEndpoint) -> UInt16? {
+        guard case let .hostPort(host: _, port: port) = endpoint else {
+            return nil
+        }
+
+        return port.rawValue
+    }
+
+    nonisolated static func strictTXTBoardIDByte(from boardID: String?) -> UInt8? {
+        guard let boardID, !boardID.isEmpty else {
+            return nil
+        }
+
+        guard boardID.utf8.allSatisfy({ (0x30...0x39).contains($0) }) else {
+            return nil
+        }
+
+        guard let byte = UInt8(boardID, radix: 10), byte != ESP32TCPClient.reservedBoardID else {
+            return nil
+        }
+
+        return byte
     }
 
     nonisolated static func txtValues(from metadata: NWBrowser.Result.Metadata) -> [String: String] {
@@ -692,6 +927,14 @@ final class ESP32DiscoveryService: ObservableObject {
         }
 
         return name
+    }
+
+    nonisolated static func serviceEndpointMetadata(from endpoint: NWEndpoint) -> (name: String, type: String, domain: String)? {
+        guard case let .service(name: name, type: type, domain: domain, interface: _) = endpoint else {
+            return nil
+        }
+
+        return (name, type, domain)
     }
 
     nonisolated static func sortDevices(_ devices: [DiscoveredESP32]) -> [DiscoveredESP32] {
@@ -714,6 +957,16 @@ final class ESP32DiscoveryService: ObservableObject {
             }
 
             return lhs.stableEndpointDescription < rhs.stableEndpointDescription
+        }
+    }
+
+    nonisolated static func sortLogoEndpoints(_ endpoints: [DiscoveredLogoUploadEndpoint]) -> [DiscoveredLogoUploadEndpoint] {
+        endpoints.sorted { lhs, rhs in
+            if lhs.boardID != rhs.boardID {
+                return lhs.boardID < rhs.boardID
+            }
+
+            return String(describing: lhs.endpoint) < String(describing: rhs.endpoint)
         }
     }
 
