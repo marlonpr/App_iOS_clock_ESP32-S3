@@ -11,7 +11,7 @@ import SwiftUI
 struct ESP32ControllerApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ESP32ControllerRootView()
         }
     }
 }

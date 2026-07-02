@@ -11,6 +11,7 @@ import ImageIO
 import Network
 import Combine
 import UniformTypeIdentifiers
+import UIKit
 @testable import ESP32Controller
 
 @Suite(.serialized)
@@ -111,6 +112,855 @@ struct ESP32ControllerTests {
         #expect(viewModel.scannerState == .idle)
         #expect(!viewModel.isRefreshingDevices)
     }
+
+    @MainActor
+    @Test func zeitBadgeAssetNameIsStableAndAvailable() {
+        #expect(ZeitBrandAssets.badgeImageName == "ZeitBadge")
+        #expect(UIImage(named: ZeitBrandAssets.badgeImageName) != nil)
+    }
+
+    @MainActor
+    @Test func zeitBadgeDoesNotModifyControllerNetworkingState() {
+        let viewModel = ESP32ControllerViewModel()
+
+        _ = ZeitBrandBadge(size: .controller)
+
+        #expect(!viewModel.isNetworkingAuthorized)
+        #expect(viewModel.scannerState == .idle)
+        #expect(viewModel.connectionStatusText == "Disconnected")
+    }
+
+#if LOGIN_ENABLED
+    @MainActor
+    @Test func localMasterAuthenticationAcceptsCorrectCredentials() async throws {
+        let service = makeLocalAuthenticationService(username: "master", password: "correct horse")
+
+        let user = try await service.authenticate(username: "master", password: "correct horse")
+
+        #expect(user.username == "master")
+        #expect(user.role == .master)
+    }
+
+    @MainActor
+    @Test func localMasterAuthenticationRejectsWrongUsername() async {
+        let service = makeLocalAuthenticationService(username: "master", password: "correct horse")
+
+        await expectAuthenticationFailure {
+            _ = try await service.authenticate(username: "operator", password: "correct horse")
+        }
+    }
+
+    @MainActor
+    @Test func localMasterAuthenticationRejectsWrongPassword() async {
+        let service = makeLocalAuthenticationService(username: "master", password: "correct horse")
+
+        await expectAuthenticationFailure {
+            _ = try await service.authenticate(username: "master", password: "wrong horse")
+        }
+    }
+
+    @MainActor
+    @Test func localMasterAuthenticationRejectsEmptyCredentials() async {
+        let service = makeLocalAuthenticationService(username: "master", password: "correct horse")
+
+        await expectAuthenticationFailure {
+            _ = try await service.authenticate(username: "", password: "")
+        }
+    }
+
+    @MainActor
+    @Test func localMasterAuthenticationTrimsUsernameWhitespace() async throws {
+        let service = makeLocalAuthenticationService(username: "master", password: "correct horse")
+
+        let user = try await service.authenticate(username: "  master\n", password: "correct horse")
+
+        #expect(user.username == "master")
+    }
+
+    @MainActor
+    @Test func localMasterAuthenticationPreservesPasswordWhitespace() async throws {
+        let service = makeLocalAuthenticationService(username: "master", password: " correct horse ")
+
+        _ = try await service.authenticate(username: "master", password: " correct horse ")
+        await expectAuthenticationFailure {
+            _ = try await service.authenticate(username: "master", password: "correct horse")
+        }
+    }
+
+    @MainActor
+    @Test func authenticatedUserDoesNotExposeSubmittedPassword() async throws {
+        let password = "correct horse"
+        let service = makeLocalAuthenticationService(username: "master", password: password)
+
+        let user = try await service.authenticate(username: "master", password: password)
+
+        #expect(user.id != password)
+        #expect(user.username != password)
+        #expect(user.displayName != password)
+    }
+
+    @MainActor
+    @Test func authenticationSessionStartsLoggedOut() {
+        let session = AuthenticationSession(authenticationService: SucceedingAuthenticationService())
+
+        #expect(session.state == .loggedOut)
+    }
+
+    @MainActor
+    @Test func authenticationSessionBecomesAuthenticatedAfterSuccess() async {
+        let session = AuthenticationSession(authenticationService: SucceedingAuthenticationService())
+
+        await session.authenticate(username: "master", password: "correct horse")
+
+        #expect(session.authenticatedUser?.role == .master)
+    }
+
+    @MainActor
+    @Test func authenticationSessionBecomesFailedAfterFailure() async {
+        let session = AuthenticationSession(authenticationService: FailingAuthenticationService())
+
+        await session.authenticate(username: "master", password: "wrong horse")
+
+        #expect(session.state == .failed(AuthenticationSession.genericFailureMessage))
+    }
+
+    @MainActor
+    @Test func duplicateSignInAttemptsPerformOneAuthenticationAttempt() async {
+        let service = SuspendedAuthenticationService()
+        let session = AuthenticationSession(authenticationService: service)
+
+        let firstAttempt = Task {
+            await session.authenticate(username: "master", password: "correct horse")
+        }
+        await drainMainQueue()
+        let secondAttempt = Task {
+            await session.authenticate(username: "master", password: "correct horse")
+        }
+        await drainMainQueue()
+
+        #expect(service.attemptCount == 1)
+
+        service.succeed()
+        await firstAttempt.value
+        await secondAttempt.value
+        #expect(session.isAuthenticated)
+    }
+
+    @MainActor
+    @Test func authenticationSessionLogoutReturnsToLoggedOut() async {
+        let session = AuthenticationSession(authenticationService: SucceedingAuthenticationService())
+
+        await session.authenticate(username: "master", password: "correct horse")
+        await session.logOut()
+
+        #expect(session.state == .loggedOut)
+    }
+
+    @MainActor
+    @Test func authenticationSessionBackgroundAndForegroundDoNotLogOut() async {
+        let session = AuthenticationSession(authenticationService: SucceedingAuthenticationService())
+
+        await session.authenticate(username: "master", password: "correct horse")
+        session.handleAppEnteredBackground()
+        session.handleAppBecameActive()
+
+        #expect(session.isAuthenticated)
+    }
+
+    @MainActor
+    @Test func loginFormInitialFocusIsNil() {
+        let form = LoginFormPresentationState()
+
+        #expect(form.focusedField == nil)
+    }
+
+    @MainActor
+    @Test func loginFormDisablesEmptyUsernameOrPasswordAndAuthenticatingSubmission() {
+        var form = LoginFormPresentationState(username: "", password: "password")
+        #expect(!form.canSubmit)
+
+        form.username = "master"
+        form.password = ""
+        #expect(!form.canSubmit)
+
+        form.password = "password"
+        #expect(form.canSubmit)
+
+        form.isAuthenticating = true
+        #expect(!form.canSubmit)
+    }
+
+    @MainActor
+    @Test func loginFormFailureShowsGenericErrorClearsPasswordAndRetainsUsername() {
+        var form = LoginFormPresentationState(username: "master", password: "wrong horse")
+        form.focusedField = .password
+
+        form.applyFailedAuthentication(message: AuthenticationSession.genericFailureMessage)
+
+        #expect(form.failureMessage == "Invalid username or password.")
+        #expect(form.password.isEmpty)
+        #expect(form.username == "master")
+        #expect(form.focusedField == nil)
+    }
+
+    @MainActor
+    @Test func sessionRestorationFailureDoesNotRequestLoginFocus() {
+        var form = LoginFormPresentationState(username: "master", password: "stored entry")
+
+        form.applyAuthenticationState(.failed(AuthenticationSession.serverUnavailableMessage))
+
+        #expect(form.focusedField == nil)
+    }
+
+    @MainActor
+    @Test func logoutClearsLoginFocus() {
+        var form = LoginFormPresentationState(username: "master", password: "stored entry")
+        form.focusedField = .password
+
+        form.applyAuthenticationState(.loggedOut)
+
+        #expect(form.focusedField == nil)
+    }
+
+    @MainActor
+    @Test func usernameSubmitAdvancesToPasswordOnlyAfterUserInteraction() {
+        var form = LoginFormPresentationState(username: "master", password: "stored entry")
+
+        form.submitUsername(userInitiated: false)
+        #expect(form.focusedField == nil)
+
+        form.submitUsername(userInitiated: true)
+        #expect(form.focusedField == .password)
+    }
+
+    @MainActor
+    @Test func passwordSubmitIsAllowedOnlyWhenLoginCanSubmit() {
+        var form = LoginFormPresentationState(username: "master", password: "stored entry")
+
+        #expect(form.shouldSubmitPassword(sessionIsAuthenticating: false, sessionIsRestoring: false))
+        #expect(!form.shouldSubmitPassword(sessionIsAuthenticating: true, sessionIsRestoring: false))
+        #expect(!form.shouldSubmitPassword(sessionIsAuthenticating: false, sessionIsRestoring: true))
+
+        form.password = ""
+        #expect(!form.shouldSubmitPassword(sessionIsAuthenticating: false, sessionIsRestoring: false))
+    }
+
+    @MainActor
+    @Test func loginBuildBeginsWithNetworkingUnauthorized() {
+        let viewModel = ESP32ControllerViewModel()
+
+        #expect(ESP32ControllerBuildConfiguration.isLoginEnabled)
+        #expect(!ESP32ControllerBuildConfiguration.authorizesNetworkingAtLaunch)
+        #expect(!viewModel.isNetworkingAuthorized)
+    }
+
+    @MainActor
+    @Test func zeitBadgeDoesNotModifyAuthenticationState() {
+        let session = AuthenticationSession(authenticationService: SucceedingAuthenticationService())
+
+        _ = ZeitBrandBadge(size: .login)
+
+        #expect(session.state == .loggedOut)
+    }
+
+    @Test func authenticationAPIClientPostsLoginRequestWithExpectedURLBodyAndContentType() async throws {
+        var capturedRequest: URLRequest?
+        let client = makeMockedAuthenticationAPIClient { request in
+            capturedRequest = request
+            return makeHTTPResponse(
+                url: try #require(request.url),
+                statusCode: 200,
+                body: loginResponseData(token: "token-1")
+            )
+        }
+
+        _ = try await client.login(
+            baseURL: testAuthBaseURL,
+            username: "example",
+            password: "Exact Password"
+        )
+
+        let request = try #require(capturedRequest)
+        #expect(request.url?.absoluteString == "http://auth.example:8080/api/login")
+        #expect(request.httpMethod == "POST")
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+
+        let body = try requestBodyJSON(request)
+        #expect(body["username"] as? String == "example")
+        #expect(body["password"] as? String == "Exact Password")
+    }
+
+    @Test func authenticationAPIClientDecodesCamelCaseLoginResponse() async throws {
+        let client = makeMockedAuthenticationAPIClient { request in
+            makeHTTPResponse(
+                url: try #require(request.url),
+                statusCode: 200,
+                body: loginResponseData(token: "token-2", username: "example")
+            )
+        }
+
+        let response = try await client.login(
+            baseURL: testAuthBaseURL,
+            username: "example",
+            password: "Exact Password"
+        )
+
+        #expect(response.token == "token-2")
+        #expect(response.expiresAt.timeIntervalSince1970 > 0)
+        #expect(response.user.id == 1)
+        #expect(response.user.username == "example")
+        #expect(response.user.displayName == "Example User")
+        #expect(response.user.role == "master")
+    }
+
+    @Test func authenticationAPIClientMapsHTTPFailuresAndMalformedJSON() async throws {
+        let unauthorized = makeMockedAuthenticationAPIClient(statusCode: 401, body: Data())
+        await expectAPIError(.unauthorized) {
+            _ = try await unauthorized.login(baseURL: testAuthBaseURL, username: "u", password: "p")
+        }
+
+        let rateLimited = makeMockedAuthenticationAPIClient(statusCode: 429, body: Data())
+        await expectAPIError(.rateLimited) {
+            _ = try await rateLimited.login(baseURL: testAuthBaseURL, username: "u", password: "p")
+        }
+
+        let serverFailure = makeMockedAuthenticationAPIClient(statusCode: 500, body: Data())
+        await expectAPIError(.serverError(statusCode: 500)) {
+            _ = try await serverFailure.login(baseURL: testAuthBaseURL, username: "u", password: "p")
+        }
+
+        let malformed = makeMockedAuthenticationAPIClient(statusCode: 200, body: Data("{".utf8))
+        await expectAPIError(.malformedResponse) {
+            _ = try await malformed.login(baseURL: testAuthBaseURL, username: "u", password: "p")
+        }
+    }
+
+    @Test func authenticationAPIClientMapsNetworkTimeoutToServerUnavailable() async {
+        let client = makeMockedAuthenticationAPIClient { _ in
+            throw URLError(.timedOut)
+        }
+
+        await expectAPIError(.serverUnavailable) {
+            _ = try await client.login(baseURL: testAuthBaseURL, username: "u", password: "p")
+        }
+    }
+
+    @Test func authenticationAPIClientUsesBearerHeaderForSessionAndLogout() async throws {
+        var capturedRequests: [URLRequest] = []
+        let client = makeMockedAuthenticationAPIClient { request in
+            capturedRequests.append(request)
+            let body: Data
+            if request.url?.path == "/api/logout" {
+                body = Data(#"{"status":"ok"}"#.utf8)
+            } else {
+                body = sessionResponseData()
+            }
+            return makeHTTPResponse(url: try #require(request.url), statusCode: 200, body: body)
+        }
+
+        _ = try await client.session(baseURL: testAuthBaseURL, token: "session-token")
+        try await client.logout(baseURL: testAuthBaseURL, token: "session-token")
+
+        #expect(capturedRequests.map { $0.url?.path } == ["/api/session", "/api/logout"])
+        #expect(capturedRequests.map { $0.value(forHTTPHeaderField: "Authorization") } == [
+            "Bearer session-token",
+            "Bearer session-token"
+        ])
+    }
+
+    @Test func authenticationAPIClientHealthUsesConfiguredBaseURL() async throws {
+        var capturedURL: URL?
+        let client = makeMockedAuthenticationAPIClient { request in
+            capturedURL = request.url
+            return makeHTTPResponse(
+                url: try #require(request.url),
+                statusCode: 200,
+                body: Data(#"{"status":"ok"}"#.utf8)
+            )
+        }
+
+        try await client.health(baseURL: URL(string: "http://configured.example:9000")!)
+
+        #expect(capturedURL?.absoluteString == "http://configured.example:9000/api/health")
+    }
+
+    @MainActor
+    @Test func keychainSessionTokenStoreSavesLoadsReplacesAndDeletesToken() throws {
+        let store = KeychainSessionTokenStore(service: "ESP32ControllerTests.\(UUID().uuidString)")
+        try store.deleteToken()
+
+        try store.saveToken("first-token")
+        #expect(try store.loadToken() == "first-token")
+
+        try store.saveToken("replacement-token")
+        #expect(try store.loadToken() == "replacement-token")
+
+        try store.deleteToken()
+        #expect(try store.loadToken() == nil)
+    }
+
+    @MainActor
+    @Test func keychainSessionTokenStoreDoesNotWriteTokenToUserDefaults() throws {
+        let defaults = makeIsolatedUserDefaults()
+        let store = KeychainSessionTokenStore(service: "ESP32ControllerTests.\(UUID().uuidString)")
+        try store.deleteToken()
+
+        try store.saveToken("keychain-only-token")
+
+        let persistedText = defaults.dictionaryRepresentation().values.map { "\($0)" }.joined(separator: "\n")
+        #expect(!persistedText.contains("keychain-only-token"))
+        try store.deleteToken()
+    }
+
+    @MainActor
+    @Test func databaseAuthenticationSuccessSavesTokenAndAuthenticates() async {
+        let tokenStore = InMemorySessionTokenStore()
+        let session = makeDatabaseAuthenticationSession(
+            tokenStore: tokenStore,
+            apiClient: makeMockedAuthenticationAPIClient(statusCode: 200, body: loginResponseData(token: "saved-token"))
+        )
+
+        await session.authenticate(username: " Example ", password: "Exact Password")
+
+        #expect(session.authenticatedUser?.username == "example")
+        #expect(session.authenticatedUser?.role == .master)
+        #expect(tokenStore.token == "saved-token")
+    }
+
+    @MainActor
+    @Test func databaseAuthenticationStorageFailureDoesNotAuthenticate() async {
+        let tokenStore = InMemorySessionTokenStore()
+        tokenStore.saveError = SessionTokenStoreError.unexpectedStatus(errSecAuthFailed)
+        let session = makeDatabaseAuthenticationSession(
+            tokenStore: tokenStore,
+            apiClient: makeMockedAuthenticationAPIClient(statusCode: 200, body: loginResponseData(token: "unsaved-token"))
+        )
+
+        await session.authenticate(username: "example", password: "Exact Password")
+
+        #expect(!session.isAuthenticated)
+        #expect(session.failureMessage == AuthenticationSession.genericServerFailureMessage)
+    }
+
+    @MainActor
+    @Test func databaseAuthenticationFailureMessagesAreNonSensitive() async {
+        enum MockFailure {
+            case status(Int, Data)
+            case timeout
+        }
+
+        let cases: [(MockFailure, String)] = [
+            (.status(401, Data()), "Invalid username or password."),
+            (.status(429, Data()), "Too many login attempts. Please wait and try again."),
+            (.timeout, "Authentication server unavailable."),
+            (.status(500, Data()), "Authentication failed. Please try again."),
+            (.status(200, Data("{".utf8)), "Authentication failed. Please try again.")
+        ]
+
+        for (failure, expectedMessage) in cases {
+            let client: AuthenticationAPIClient
+            switch failure {
+            case let .status(statusCode, body):
+                client = makeMockedAuthenticationAPIClient(statusCode: statusCode, body: body)
+            case .timeout:
+                client = makeMockedAuthenticationAPIClient { _ in throw URLError(.timedOut) }
+            }
+            let session = makeDatabaseAuthenticationSession(apiClient: client)
+            await session.authenticate(username: "example", password: "Exact Password")
+            #expect(session.failureMessage == expectedMessage)
+        }
+    }
+
+    @MainActor
+    @Test func databaseAuthenticationRejectsUnknownRoles() async {
+        let session = makeDatabaseAuthenticationSession(
+            apiClient: makeMockedAuthenticationAPIClient(
+                statusCode: 200,
+                body: loginResponseData(token: "token", role: "operator")
+            )
+        )
+
+        await session.authenticate(username: "example", password: "Exact Password")
+
+        #expect(!session.isAuthenticated)
+        #expect(session.failureMessage == AuthenticationSession.genericServerFailureMessage)
+    }
+
+    @MainActor
+    @Test func sessionRestoreWithoutTokenShowsLogin() async {
+        let session = makeDatabaseAuthenticationSession(tokenStore: InMemorySessionTokenStore())
+
+        await session.restoreStoredSession()
+
+        #expect(session.state == .loggedOut)
+    }
+
+    @MainActor
+    @Test func sessionRestoreWithValidTokenAuthenticates() async {
+        let tokenStore = InMemorySessionTokenStore(token: "stored-token")
+        let session = makeDatabaseAuthenticationSession(
+            tokenStore: tokenStore,
+            apiClient: makeMockedAuthenticationAPIClient(statusCode: 200, body: sessionResponseData())
+        )
+
+        await session.restoreStoredSession()
+
+        #expect(session.authenticatedUser?.username == "example")
+        #expect(session.diagnostics?.provider == "Server")
+        #expect(session.diagnostics?.sessionStatus == "Valid")
+    }
+
+    @MainActor
+    @Test func sessionRestoreWithUnauthorizedTokenDeletesTokenAndShowsLogin() async {
+        let tokenStore = InMemorySessionTokenStore(token: "expired-token")
+        let session = makeDatabaseAuthenticationSession(
+            tokenStore: tokenStore,
+            apiClient: makeMockedAuthenticationAPIClient(statusCode: 401, body: Data())
+        )
+
+        await session.restoreStoredSession()
+
+        #expect(session.state == .loggedOut)
+        #expect(tokenStore.token == nil)
+    }
+
+    @MainActor
+    @Test func sessionRestoreNetworkFailurePreservesTokenAndCanRetry() async {
+        let tokenStore = InMemorySessionTokenStore(token: "preserved-token")
+        var attempt = 0
+        let session = makeDatabaseAuthenticationSession(
+            tokenStore: tokenStore,
+            apiClient: makeMockedAuthenticationAPIClient { request in
+                attempt += 1
+                if attempt == 1 {
+                    throw URLError(.timedOut)
+                }
+                return makeHTTPResponse(
+                    url: try #require(request.url),
+                    statusCode: 200,
+                    body: sessionResponseData()
+                )
+            }
+        )
+
+        await session.restoreStoredSession()
+        #expect(!session.isAuthenticated)
+        #expect(session.failureMessage == "Authentication server unavailable.")
+        #expect(tokenStore.token == "preserved-token")
+        #expect(session.canRetrySessionRestore)
+
+        await session.retrySessionRestore()
+        #expect(session.isAuthenticated)
+        #expect(attempt == 2)
+    }
+
+    @MainActor
+    @Test func staleRestoreCallbackCannotAuthenticateAfterLogout() async {
+        let service = SuspendedRestoreAuthenticationService()
+        let session = AuthenticationSession(authenticationService: service)
+
+        let restoreTask = Task {
+            await session.restoreStoredSession()
+        }
+        await drainMainQueue()
+        await session.logOut()
+        service.succeed()
+        await restoreTask.value
+
+        #expect(session.state == .loggedOut)
+    }
+
+    @MainActor
+    @Test func databaseLogoutDeletesTokenWhenServerIsUnavailable() async {
+        let tokenStore = InMemorySessionTokenStore(token: "logout-token")
+        let session = makeDatabaseAuthenticationSession(
+            tokenStore: tokenStore,
+            apiClient: makeMockedAuthenticationAPIClient { _ in
+                throw URLError(.cannotConnectToHost)
+            }
+        )
+
+        await session.logOut()
+
+        #expect(session.state == .loggedOut)
+        #expect(tokenStore.token == nil)
+    }
+
+    @MainActor
+    @Test func changingServerConfigurationInvalidatesExistingSession() async {
+        let tokenStore = InMemorySessionTokenStore()
+        let defaults = makeIsolatedUserDefaults()
+        let session = makeDatabaseAuthenticationSession(
+            tokenStore: tokenStore,
+            userDefaults: defaults,
+            apiClient: makeMockedAuthenticationAPIClient { request in
+                if request.url?.path == "/api/logout" {
+                    return makeHTTPResponse(
+                        url: try #require(request.url),
+                        statusCode: 200,
+                        body: Data(#"{"status":"ok"}"#.utf8)
+                    )
+                }
+                return makeHTTPResponse(
+                    url: try #require(request.url),
+                    statusCode: 200,
+                    body: loginResponseData(token: "server-change-token")
+                )
+            }
+        )
+
+        await session.authenticate(username: "example", password: "Exact Password")
+        session.serverURLText = "https://new-auth.example:9443/"
+        try? await session.saveServerConfigurationIfNeeded()
+
+        #expect(session.state == .loggedOut)
+        #expect(tokenStore.token == nil)
+        #expect(session.serverURLText == "https://new-auth.example:9443")
+    }
+
+    @Test func authServerConfigurationValidationAcceptsAndNormalizesValidURLs() throws {
+        #expect(try AuthServerConfiguration.normalizedBaseURL(from: "http://auth.example:8080/").absoluteString == "http://auth.example:8080")
+        #expect(try AuthServerConfiguration.normalizedBaseURL(from: "https://auth.example").absoluteString == "https://auth.example")
+    }
+
+    @Test func authServerConfigurationValidationRejectsUnsafeOrMalformedURLs() {
+        for value in [
+            "",
+            "ftp://auth.example",
+            "http://",
+            "http://auth.example:70000",
+            "http://user:pass@auth.example",
+            "http://auth.example?query=1",
+            "http://auth.example#fragment"
+        ] {
+            #expect(throws: AuthServerConfigurationError.self) {
+                _ = try AuthServerConfiguration.normalizedBaseURL(from: value)
+            }
+        }
+    }
+#endif
+
+    @MainActor
+    @Test func loggedOutStartupDoesNotStartDiscoveryOrConnect() {
+        var browserCount = 0
+        var logoBrowserCount = 0
+        let recorder = FakeTCPConnectionRecorder()
+        let client = ESP32TCPClient(
+            connectionFactory: { _, _ in recorder.makeConnection() },
+            endpointConnectionFactory: { _ in recorder.makeConnection() }
+        )
+        let discoveryService = ESP32DiscoveryService(
+            browserFactory: {
+                browserCount += 1
+                return FakeESP32Browser()
+            },
+            logoBrowserFactory: {
+                logoBrowserCount += 1
+                return FakeESP32Browser()
+            }
+        )
+        let viewModel = ESP32ControllerViewModel(client: client, discoveryService: discoveryService)
+
+        viewModel.startDiscovery()
+        viewModel.connect()
+
+        #expect(!viewModel.isNetworkingAuthorized)
+        #expect(browserCount == 0)
+        #expect(logoBrowserCount == 0)
+        #expect(recorder.connections.isEmpty)
+    }
+
+    @MainActor
+    @Test func loggedOutActiveEventDoesNotReconnect() async {
+        let recorder = FakeTCPConnectionRecorder()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = unauthorizedViewModel(recorder: recorder, userDefaults: defaults)
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+
+        #expect(recorder.connections.isEmpty)
+    }
+
+    @MainActor
+    @Test func authorizingNetworkingStartsForegroundRecoveryOnce() async {
+        let recorder = FakeTCPConnectionRecorder()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = unauthorizedViewModel(recorder: recorder, userDefaults: defaults)
+
+        viewModel.authorizeNetworking()
+        viewModel.handleAppBecameActive()
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+
+        #expect(viewModel.isNetworkingAuthorized)
+        #expect(recorder.connections.count == 1)
+        #expect(viewModel.connectionStatusText.contains("Clock 0"))
+    }
+
+    @MainActor
+    @Test func logoutStopsHeartbeatAndCancelsControlConnection() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let heartbeatScheduler = FakeHeartbeatScheduler()
+        let ackTimeouts = FakeHeartbeatScheduler()
+        let viewModel = makeViewModelForManualHeartbeatTests(
+            recorder: recorder,
+            heartbeatScheduler: heartbeatScheduler,
+            ackTimeouts: ackTimeouts,
+            userDefaults: makeIsolatedUserDefaults()
+        )
+
+        viewModel.manualBoardID = "0"
+        viewModel.connect()
+        await drainMainQueue()
+        let connection = try #require(recorder.connections.first)
+        connection.stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        viewModel.revokeNetworkingAuthorization()
+        await drainMainQueue()
+
+        #expect(!viewModel.isNetworkingAuthorized)
+        #expect(heartbeatScheduler.tasks.first?.isCancelled == true)
+        #expect(connection.cancelCallCount >= 1)
+    }
+
+    @MainActor
+    @Test func logoutCancelsReconnectRetries() async {
+        let recorder = FakeTCPConnectionRecorder()
+        let reconnectScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            reconnectScheduler: reconnectScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+        viewModel.revokeNetworkingAuthorization()
+
+        let allRetriesCancelled = reconnectScheduler.tasks.allSatisfy(\.isCancelled)
+        #expect(allRetriesCancelled)
+    }
+
+    @MainActor
+    @Test func logoutPreventsStaleCallbacksFromRestoringConnectionState() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            userDefaults: makeIsolatedUserDefaults()
+        )
+
+        viewModel.manualBoardID = "0"
+        viewModel.connect()
+        await drainMainQueue()
+        let connection = try #require(recorder.connections.first)
+        let staleHandler = connection.stateUpdateHandler
+
+        viewModel.revokeNetworkingAuthorization()
+        staleHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(!viewModel.isNetworkingAuthorized)
+        #expect(viewModel.state == .disconnected)
+    }
+
+    @MainActor
+    @Test func loginAfterLogoutPermitsCachedReconnectAgain() async {
+        let recorder = FakeTCPConnectionRecorder()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            userDefaults: defaults
+        )
+
+        viewModel.revokeNetworkingAuthorization()
+        viewModel.authorizeNetworking()
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+
+        #expect(viewModel.isNetworkingAuthorized)
+        #expect(recorder.connections.count == 1)
+    }
+
+    @MainActor
+    @Test func cachedDeviceIdentitySurvivesLogout() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            userDefaults: makeIsolatedUserDefaults()
+        )
+
+        viewModel.manualBoardID = "0"
+        viewModel.connect()
+        await drainMainQueue()
+        let connection = try #require(recorder.connections.first)
+        connection.stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        viewModel.revokeNetworkingAuthorization()
+
+        #expect(viewModel.lastConnectedDevice?.boardID == 0)
+    }
+
+#if LOGIN_ENABLED
+    @MainActor
+    @Test func authenticationIsNotRestoredAfterSessionRecreation() async {
+        let service = SucceedingAuthenticationService()
+        let session = AuthenticationSession(authenticationService: service)
+
+        await session.authenticate(username: "master", password: "correct horse")
+        let recreated = AuthenticationSession(authenticationService: service)
+
+        #expect(recreated.state == .loggedOut)
+    }
+
+    @MainActor
+    @Test func authenticationDoesNotWritePlaintextPasswordOrAutoLoginFlagToUserDefaults() async {
+        let defaults = makeIsolatedUserDefaults()
+        let password = "test credential only"
+        let session = AuthenticationSession(
+            authenticationService: makeLocalAuthenticationService(
+                username: "master",
+                password: password
+            )
+        )
+
+        await session.authenticate(username: "master", password: password)
+
+        let persistedValues = defaults.dictionaryRepresentation()
+        #expect(!persistedValues.values.contains { "\($0)".contains(password) })
+        #expect(persistedValues.keys.allSatisfy { !$0.localizedCaseInsensitiveContains("authenticated") })
+    }
+#endif
+
+#if DIRECT_BUILD
+    @MainActor
+    @Test func directBuildAuthorizesNetworkingImmediatelyByConfiguration() {
+        let viewModel = ESP32ControllerViewModel()
+
+        if ESP32ControllerBuildConfiguration.authorizesNetworkingAtLaunch {
+            viewModel.authorizeNetworking()
+        }
+
+        #expect(!ESP32ControllerBuildConfiguration.isLoginEnabled)
+        #expect(viewModel.isNetworkingAuthorized)
+    }
+
+    @Test func directBuildHasNoRuntimeLoginBypassState() {
+        let defaults = makeIsolatedUserDefaults()
+
+        #expect(!ESP32ControllerBuildConfiguration.isLoginEnabled)
+        #expect(ESP32ControllerBuildConfiguration.authorizesNetworkingAtLaunch)
+        #expect(defaults.object(forKey: "LOGIN_ENABLED") == nil)
+        #expect(defaults.object(forKey: "ESP32Controller.AuthenticationBypass") == nil)
+    }
+#endif
 
     @Test func clockProtocolEncodesConnectionTestForBoardZero() throws {
         let frame = try ClockProtocolEncoder.encode(.connectionTest, boardID: 0)
@@ -2249,6 +3099,7 @@ struct ESP32ControllerTests {
             logoImageConverter: { _, _ in try makeLogoConversionResult(payload: payload) },
             userDefaults: makeIsolatedUserDefaults()
         )
+        viewModel.authorizeNetworking()
 
         viewModel.manualBoardID = "0"
         viewModel.connect()
@@ -2547,6 +3398,7 @@ struct ESP32ControllerTests {
             ),
             userDefaults: defaults
         )
+        viewModel.authorizeNetworking()
 
         viewModel.handleAppBecameActive()
         await drainMainQueue()
@@ -2583,6 +3435,7 @@ struct ESP32ControllerTests {
             reconnectScheduler: reconnectScheduler.schedule(_:_:),
             userDefaults: defaults
         )
+        viewModel.authorizeNetworking()
 
         viewModel.handleAppBecameActive()
         await drainMainQueue()
@@ -2628,6 +3481,7 @@ struct ESP32ControllerTests {
             ),
             userDefaults: defaults
         )
+        viewModel.authorizeNetworking()
 
         viewModel.handleAppBecameActive()
         await drainMainQueue()
@@ -3054,6 +3908,7 @@ struct ESP32ControllerTests {
             discoveryService: discoveryService,
             userDefaults: makeIsolatedUserDefaults()
         )
+        viewModel.authorizeNetworking()
 
         viewModel.handleAppBecameActive()
         viewModel.handleAppBecameActive()
@@ -3121,6 +3976,7 @@ struct ESP32ControllerTests {
             }
         )
         let viewModel = ESP32ControllerViewModel(client: client, discoveryService: discoveryService)
+        viewModel.authorizeNetworking()
 
         viewModel.presentDeviceScanner()
         #expect(browserCount == 0)
@@ -4365,6 +5221,7 @@ struct ESP32ControllerTests {
                 logoBrowserFactory: { FakeESP32Browser() }
             )
         )
+        viewModel.authorizeNetworking()
         let device = makeDevice(id: "service-decimal", serviceName: "ESP32 Decimal", boardID: "10")
 
         viewModel.connect(to: device)
@@ -4398,6 +5255,7 @@ struct ESP32ControllerTests {
                 logoBrowserFactory: { FakeESP32Browser() }
             )
         )
+        viewModel.authorizeNetworking()
         let device = makeDevice(id: "service-invalid", serviceName: "ESP32 Invalid", boardID: "0A")
 
         viewModel.connect(to: device)
@@ -4427,6 +5285,7 @@ struct ESP32ControllerTests {
                 logoBrowserFactory: { FakeESP32Browser() }
             )
         )
+        viewModel.authorizeNetworking()
         let device = makeDevice(id: "service-reserved", serviceName: "ESP32 Reserved", boardID: "92")
 
         viewModel.connect(to: device)
@@ -4462,6 +5321,7 @@ struct ESP32ControllerTests {
                 logoBrowserFactory: { FakeESP32Browser() }
             )
         )
+        viewModel.authorizeNetworking()
         let device = makeDevice(id: "service-missing", serviceName: "ESP32 Missing", boardID: nil)
 
         viewModel.connect(to: device)
@@ -4997,6 +5857,7 @@ struct ESP32ControllerTests {
                 logoBrowserFactory: { FakeESP32Browser() }
             )
         )
+        viewModel.authorizeNetworking()
         let validDevice = makeDevice(id: "service-valid", serviceName: "ESP32 Valid", boardID: "7")
         let reservedDevice = makeDevice(id: "service-reserved", serviceName: "ESP32 Reserved", boardID: "92")
 
@@ -5805,6 +6666,326 @@ struct ESP32ControllerTests {
     }
 }
 
+#if LOGIN_ENABLED
+private func makeAuthenticatedUser(username: String = "master") -> AuthenticatedUser {
+    AuthenticatedUser(
+        id: "test-user",
+        username: username,
+        displayName: "Test Master",
+        role: .master
+    )
+}
+
+@MainActor
+private func makeLocalAuthenticationService(
+    username: String,
+    password: String,
+    salt: String = "test-salt"
+) -> LocalMasterAuthenticationService {
+    LocalMasterAuthenticationService(
+        username: username,
+        salt: salt,
+        passwordHashHex: LocalMasterAuthenticationService.passwordHashHex(
+            salt: salt,
+            password: password
+        )
+    )
+}
+
+private func expectAuthenticationFailure(_ operation: () async throws -> Void) async {
+    do {
+        try await operation()
+        Issue.record("Authentication should have failed")
+    } catch {
+        #expect(error as? AuthenticationFailure == .invalidCredentials)
+    }
+}
+
+private struct SucceedingAuthenticationService: AuthenticationService {
+    func authenticate(username: String, password: String) async throws -> AuthenticatedUser {
+        makeAuthenticatedUser(username: username)
+    }
+}
+
+private struct FailingAuthenticationService: AuthenticationService {
+    func authenticate(username: String, password: String) async throws -> AuthenticatedUser {
+        throw AuthenticationFailure.invalidCredentials
+    }
+}
+
+private final class SuspendedAuthenticationService: AuthenticationService {
+    private(set) var attemptCount = 0
+    private var continuation: CheckedContinuation<AuthenticatedUser, any Error>?
+
+    func authenticate(username: String, password: String) async throws -> AuthenticatedUser {
+        attemptCount += 1
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func succeed() {
+        continuation?.resume(returning: makeAuthenticatedUser())
+        continuation = nil
+    }
+}
+
+private final class SuspendedRestoreAuthenticationService: AuthenticationService {
+    private var continuation: CheckedContinuation<AuthenticatedUser?, any Error>?
+
+    func restoreSession() async throws -> AuthenticatedUser? {
+        try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func authenticate(username: String, password: String) async throws -> AuthenticatedUser {
+        makeAuthenticatedUser(username: username)
+    }
+
+    func succeed() {
+        continuation?.resume(returning: makeAuthenticatedUser())
+        continuation = nil
+    }
+}
+
+private final class InMemorySessionTokenStore: SessionTokenStore {
+    var token: String?
+    var saveError: Error?
+    var loadError: Error?
+    var deleteError: Error?
+
+    init(token: String? = nil) {
+        self.token = token
+    }
+
+    func saveToken(_ token: String) throws {
+        if let saveError {
+            throw saveError
+        }
+        self.token = token
+    }
+
+    func loadToken() throws -> String? {
+        if let loadError {
+            throw loadError
+        }
+        return token
+    }
+
+    func deleteToken() throws {
+        if let deleteError {
+            throw deleteError
+        }
+        token = nil
+    }
+}
+
+private let testAuthBaseURL = URL(string: "http://auth.example:8080")!
+
+@MainActor
+private func makeDatabaseAuthenticationSession(
+    tokenStore: InMemorySessionTokenStore = InMemorySessionTokenStore(),
+    userDefaults: UserDefaults = makeIsolatedUserDefaults(),
+    apiClient: AuthenticationAPIClient = makeMockedAuthenticationAPIClient(
+        statusCode: 200,
+        body: loginResponseData(token: "default-token")
+    ),
+    dateProvider: @escaping () -> Date = { Date(timeIntervalSince1970: 1_783_000_000) }
+) -> AuthenticationSession {
+    let configurationStore = AuthServerConfigurationStore(
+        defaultBaseURL: testAuthBaseURL,
+        userDefaults: userDefaults,
+        userDefaultsKey: "ESP32ControllerTests.AuthServer.\(UUID().uuidString)"
+    )
+    let service = DatabaseAuthenticationService(
+        apiClient: apiClient,
+        tokenStore: tokenStore,
+        configurationStore: configurationStore,
+        dateProvider: dateProvider
+    )
+    return AuthenticationSession(authenticationService: service)
+}
+
+private func makeMockedAuthenticationAPIClient(
+    statusCode: Int,
+    body: Data
+) -> AuthenticationAPIClient {
+    makeMockedAuthenticationAPIClient { request in
+        makeHTTPResponse(url: try #require(request.url), statusCode: statusCode, body: body)
+    }
+}
+
+private func makeMockedAuthenticationAPIClient(
+    handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
+) -> AuthenticationAPIClient {
+    MockAuthenticationURLProtocol.requestHandler = handler
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [MockAuthenticationURLProtocol.self]
+    return AuthenticationAPIClient(
+        session: URLSession(configuration: configuration),
+        timeout: 0.1
+    )
+}
+
+private final class MockAuthenticationURLProtocol: URLProtocol {
+    static var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let handler = Self.requestHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private func makeHTTPResponse(
+    url: URL,
+    statusCode: Int,
+    body: Data
+) -> (HTTPURLResponse, Data) {
+    (
+        HTTPURLResponse(
+            url: url,
+            statusCode: statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!,
+        body
+    )
+}
+
+private func loginResponseData(
+    token: String,
+    username: String = "example",
+    role: String = "master"
+) -> Data {
+    Data("""
+    {
+      "token": "\(token)",
+      "expiresAt": "2026-07-02T18:30:00Z",
+      "user": {
+        "id": 1,
+        "username": "\(username)",
+        "displayName": "Example User",
+        "role": "\(role)"
+      }
+    }
+    """.utf8)
+}
+
+private func sessionResponseData(
+    username: String = "example",
+    role: String = "master"
+) -> Data {
+    Data("""
+    {
+      "expiresAt": "2026-07-02T18:30:00Z",
+      "user": {
+        "id": 1,
+        "username": "\(username)",
+        "displayName": "Example User",
+        "role": "\(role)"
+      }
+    }
+    """.utf8)
+}
+
+private func requestBodyJSON(_ request: URLRequest) throws -> [String: Any] {
+    let body: Data
+    if let httpBody = request.httpBody {
+        body = httpBody
+    } else if let stream = request.httpBodyStream {
+        body = Data(reading: stream)
+    } else {
+        body = Data()
+    }
+
+    return try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+}
+
+private func expectAPIError(
+    _ expectedError: AuthenticationAPIError,
+    operation: () async throws -> Void
+) async {
+    do {
+        try await operation()
+        Issue.record("API operation should have failed")
+    } catch {
+        #expect(error as? AuthenticationAPIError == expectedError)
+    }
+}
+
+private extension Data {
+    init(reading stream: InputStream) {
+        self.init()
+        stream.open()
+        defer {
+            stream.close()
+        }
+
+        let bufferSize = 1024
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer {
+            buffer.deallocate()
+        }
+
+        while stream.hasBytesAvailable {
+            let count = stream.read(buffer, maxLength: bufferSize)
+            if count > 0 {
+                append(buffer, count: count)
+            } else {
+                break
+            }
+        }
+    }
+}
+#endif
+
+@MainActor
+private func unauthorizedViewModel(
+    recorder: FakeTCPConnectionRecorder,
+    reconnectScheduler: @escaping ESP32ControllerViewModel.TimeSyncScheduler = { delay, callback in
+        let workItem = DispatchWorkItem(block: callback)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        return TestDispatchWorkItemCancellable(workItem: workItem)
+    },
+    userDefaults: UserDefaults = .standard
+) -> ESP32ControllerViewModel {
+    let client = ESP32TCPClient(
+        connectionFactory: { _, _ in recorder.makeConnection() },
+        endpointConnectionFactory: { _ in recorder.makeConnection() }
+    )
+    return ESP32ControllerViewModel(
+        client: client,
+        discoveryService: ESP32DiscoveryService(
+            browserFactory: { FakeESP32Browser() },
+            logoBrowserFactory: { FakeESP32Browser() }
+        ),
+        reconnectScheduler: reconnectScheduler,
+        userDefaults: userDefaults
+    )
+}
+
 private func fireLatestActiveHeartbeatTask(_ scheduler: FakeHeartbeatScheduler) throws {
     let task = try #require(scheduler.tasks.last { !$0.isCancelled })
     task.fire()
@@ -5829,7 +7010,7 @@ private func makeViewModelForManualHeartbeatTests(
         heartbeatACKTimeoutScheduler: ackTimeouts.schedule(_:_:)
     )
 
-    return ESP32ControllerViewModel(
+    let viewModel = ESP32ControllerViewModel(
         client: client,
         discoveryService: ESP32DiscoveryService(
             browserFactory: { FakeESP32Browser() },
@@ -5838,6 +7019,8 @@ private func makeViewModelForManualHeartbeatTests(
         reconnectScheduler: reconnectScheduler,
         userDefaults: userDefaults
     )
+    viewModel.authorizeNetworking()
+    return viewModel
 }
 
 private func makeBrowseResult(
@@ -6539,7 +7722,7 @@ private func makeViewModelForConnectionIndicatorTests(
         logoBrowserFactory: { logoBrowser }
     )
 
-    return ESP32ControllerViewModel(
+    let viewModel = ESP32ControllerViewModel(
         client: client,
         discoveryService: discoveryService,
         currentDateProvider: currentDateProvider,
@@ -6547,6 +7730,8 @@ private func makeViewModelForConnectionIndicatorTests(
         reconnectScheduler: reconnectScheduler,
         userDefaults: userDefaults
     )
+    viewModel.authorizeNetworking()
+    return viewModel
 }
 
 @MainActor
@@ -6576,7 +7761,7 @@ private func makeViewModelForLogoTests(
         logoBrowserFactory: { FakeESP32Browser() }
     )
 
-    return ESP32ControllerViewModel(
+    let viewModel = ESP32ControllerViewModel(
         client: client,
         discoveryService: discoveryService ?? defaultDiscoveryService,
         timeSyncScheduler: timeSyncScheduler,
@@ -6585,6 +7770,8 @@ private func makeViewModelForLogoTests(
         logoUploadClient: logoUploadClient ?? ESP32LogoUploadClient(),
         userDefaults: userDefaults
     )
+    viewModel.authorizeNetworking()
+    return viewModel
 }
 
 private func gregorianUTCCalendar() -> Calendar {

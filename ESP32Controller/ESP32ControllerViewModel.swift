@@ -64,6 +64,7 @@ final class ESP32ControllerViewModel: ObservableObject {
     @Published private(set) var reconnectAttemptDiagnosticsText = "None"
     @Published private(set) var endpointSourceDiagnosticsText = "None"
     @Published private(set) var foregroundValidationDiagnosticsText = "Idle"
+    @Published private(set) var isNetworkingAuthorized = false
 
     nonisolated static let reservedBoardIDMessage = "Board ID 92 is reserved because it equals the protocol frame delimiter 0x5C."
     nonisolated static let defaultLogoRestoreConfirmationMessage = "This removes the uploaded logo from the SD card and activates the logo built into the ESP32."
@@ -130,7 +131,11 @@ final class ESP32ControllerViewModel: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
 
     var canConnect: Bool {
-        switch state {
+        guard isNetworkingAuthorized else {
+            return false
+        }
+
+        return switch state {
         case .disconnected, .failed:
             true
         case .connecting, .connected:
@@ -139,7 +144,11 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     var canDisconnect: Bool {
-        switch state {
+        guard isNetworkingAuthorized else {
+            return false
+        }
+
+        return switch state {
         case .connecting, .connected, .failed:
             true
         case .disconnected:
@@ -148,11 +157,11 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     var canSend: Bool {
-        state == .connected
+        isNetworkingAuthorized && state == .connected
     }
 
     var canUseClockControls: Bool {
-        state == .connected && connectedProtocolBoardID != nil
+        isNetworkingAuthorized && state == .connected && connectedProtocolBoardID != nil
     }
 
     var canSyncTime: Bool {
@@ -165,6 +174,7 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     var canUploadLogo: Bool {
         guard
+            isNetworkingAuthorized,
             state == .connected,
             convertedLogoPayload?.count == LogoFileFormat.payloadLength,
             resolvedLogoUploadTargetForActiveDevice() != nil,
@@ -314,22 +324,38 @@ final class ESP32ControllerViewModel: ObservableObject {
 
         self.client.onStateChange = { [weak self] state in
             DispatchQueue.main.async {
-                self?.handleConnectionStateChange(state)
+                guard let self else {
+                    return
+                }
 
-                self?.state = state
-                self?.appendEvent(state.title)
+                guard self.isNetworkingAuthorized || state == .disconnected else {
+                    return
+                }
+
+                self.handleConnectionStateChange(state)
+
+                self.state = state
+                self.appendEvent(state.title)
             }
         }
 
         self.client.onFrameReceived = { [weak self] bytes in
             DispatchQueue.main.async {
-                self?.handleReceivedFrame(bytes)
+                guard let self, self.isNetworkingAuthorized else {
+                    return
+                }
+
+                self.handleReceivedFrame(bytes)
             }
         }
 
         self.client.onConnectionHealthChange = { [weak self] health in
             DispatchQueue.main.async {
-                self?.connectionHealth = health
+                guard let self, self.isNetworkingAuthorized || health == .idle else {
+                    return
+                }
+
+                self.connectionHealth = health
             }
         }
 
@@ -383,7 +409,30 @@ final class ESP32ControllerViewModel: ObservableObject {
         logoConversionTask?.cancel()
     }
 
+    func authorizeNetworking() {
+        guard !isNetworkingAuthorized else {
+            return
+        }
+
+        isNetworkingAuthorized = true
+        automaticReconnectEnabled = true
+        userRequestedDisconnect = false
+    }
+
+    func revokeNetworkingAuthorization() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
+        isNetworkingAuthorized = false
+        suspendNetworkingForAuthorizationLoss()
+    }
+
     func startDiscovery() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         beginDeviceScan()
     }
 
@@ -392,6 +441,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func handleAppBecameActive() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         let wasActive = isAppActive
         isAppActive = true
         appPhaseDiagnosticsText = "Active"
@@ -412,10 +465,18 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func handleAppBecameInactive() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         appPhaseDiagnosticsText = "Inactive"
     }
 
     func handleAppEnteredBackground() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         isAppActive = false
         appPhaseDiagnosticsText = "Background"
         foregroundReconnectRequired = true
@@ -447,18 +508,34 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func refreshDiscovery() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         refreshDevices()
     }
 
     func refreshDevices() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         beginDeviceScan()
     }
 
     func presentDeviceScanner() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         isScannerPresented = true
     }
 
     func beginDeviceScan() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         pendingSelectedEndpointDescription = nil
         scannerConnectionErrorText = nil
         discoveryService.beginDeviceScan(connectedEndpointDescription: connectedEndpointDescription)
@@ -471,6 +548,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func connect() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         cancelAutomaticReconnect(resetDiagnostics: true)
         cancelForegroundValidation()
         userRequestedDisconnect = false
@@ -505,6 +586,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func connect(to device: DiscoveredESP32) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         guard canSelectScannedDevice(device) else {
             return
         }
@@ -529,6 +614,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func canSelectScannedDevice(_ device: DiscoveredESP32) -> Bool {
+        guard isNetworkingAuthorized else {
+            return false
+        }
+
         if automaticReconnectGeneration != nil {
             return connectedEndpointDescription != device.stableEndpointDescription
         }
@@ -545,6 +634,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func disconnect() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         userRequestedDisconnect = true
         automaticReconnectEnabled = false
         foregroundReconnectRequired = false
@@ -634,6 +727,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func uploadLogo() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         guard state == .connected else {
             logoUploadState = .failed("Connect to an ESP32 before uploading a logo.")
             return
@@ -715,6 +812,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func presentRestoreDefaultLogoConfirmation() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         guard canRestoreDefaultLogo else {
             return
         }
@@ -723,6 +824,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func restoreDefaultLogo() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         guard !defaultLogoRestoreState.isConfirmationPending else {
             return
         }
@@ -806,6 +911,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func sendHexBytes() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         do {
             var bytes = try Self.parseHexBytes(outgoingHex)
             if appendFrameDelimiter {
@@ -869,6 +978,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func syncDeviceTime() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         guard state == .connected else {
             let message = "Connect to an ESP32 before sending clock commands."
             isTimeSyncSuccessAlertPresented = false
@@ -948,10 +1061,18 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func requestClockConfiguration() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         sendClockCommand(.readConfiguration)
     }
 
     func requestNextDisplayMode() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         guard state == .connected else {
             let message = "Connect to an ESP32 before sending clock commands."
             isDisplayModeSuccessAlertPresented = false
@@ -1015,6 +1136,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func sendCurrentClockConfiguration() {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         sendCurrentClockConfiguration(
             reason: .currentSettings,
             skipIfLastRequestedMatches: false
@@ -1022,6 +1147,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func requestDeviceReset(resetID: UInt8) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         let tracksDeviceDefaultConfiguration = resetID == 0x00
         if tracksDeviceDefaultConfiguration {
             isDeviceDefaultConfigurationSendPending = true
@@ -1041,6 +1170,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func sendClockCommand(_ command: ClockProtocolCommand) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
         sendClockCommand(command, logLabel: command.logLabel, statusMessage: command.sentStatusMessage)
     }
 
@@ -1051,6 +1184,11 @@ final class ESP32ControllerViewModel: ObservableObject {
         onSendSucceeded: (() -> Void)? = nil,
         onSendFinished: (() -> Void)? = nil
     ) {
+        guard isNetworkingAuthorized else {
+            onSendFinished?()
+            return
+        }
+
         guard state == .connected else {
             commandStatusMessage = "Connect to an ESP32 before sending clock commands."
             appendEvent(commandStatusMessage ?? "")
@@ -1670,6 +1808,41 @@ final class ESP32ControllerViewModel: ObservableObject {
         appendLog(direction: .event, bytes: [], message: message)
     }
 
+    private func suspendNetworkingForAuthorizationLoss() {
+        isAppActive = false
+        appPhaseDiagnosticsText = "Inactive"
+        foregroundReconnectRequired = false
+        automaticReconnectEnabled = false
+        userRequestedDisconnect = true
+        isScannerPresented = false
+        scannerConnectionErrorText = nil
+        pendingSelectedEndpointDescription = nil
+        cancelForegroundValidation()
+        cancelAutomaticReconnect(resetDiagnostics: true)
+        clearTimeSyncStateForConnectionChange()
+        clearDisplayModeStateForConnectionChange()
+        clearDefaultLogoRestoreStateForConnectionChange()
+        clearLogoUploadStateForConnectionChange()
+        clearClockConfigurationCacheForConnectionChange()
+        activeConnectionGeneration = nil
+        connectionAttempt = .explicitDisconnect
+        isExpectingInitialDisconnect = false
+        isBackgroundDisconnectInProgress = false
+        pendingConnectionEndpointDescription = nil
+        pendingConnectionDevice = nil
+        pendingAutomaticReconnectRecord = nil
+        pendingManualHost = nil
+        pendingManualPort = nil
+        pendingProtocolBoardID = nil
+        connectedProtocolBoardID = nil
+        connectedEndpointDescription = nil
+        connectedDiscoveredDevice = nil
+        connectionHealth = .idle
+        discoveryService.updateConnectedEndpointDescription(nil)
+        discoveryService.stopDiscovery()
+        client.disconnect()
+    }
+
     private func beginConnectionAttempt(_ target: ConnectionTarget) {
         clearTimeSyncStateForConnectionChange()
         clearDisplayModeStateForConnectionChange()
@@ -1806,6 +1979,7 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     private func validateForegroundConnectionIfNeeded() {
         guard
+            isNetworkingAuthorized,
             isAppActive,
             foregroundValidationGeneration == nil,
             let connectionGeneration = activeConnectionGeneration,
@@ -1858,6 +2032,7 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     private func startAutomaticReconnectIfPossible(replacingCurrentConnection: Bool = false) {
         guard
+            isNetworkingAuthorized,
             isAppActive,
             automaticReconnectEnabled,
             !userRequestedDisconnect,
@@ -1902,6 +2077,7 @@ final class ESP32ControllerViewModel: ObservableObject {
     ) {
         guard
             automaticReconnectGeneration == generation,
+            isNetworkingAuthorized,
             isAppActive,
             automaticReconnectEnabled,
             !userRequestedDisconnect

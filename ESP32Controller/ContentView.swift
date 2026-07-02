@@ -10,150 +10,205 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @StateObject private var viewModel = ESP32ControllerViewModel()
-    @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject var viewModel: ESP32ControllerViewModel
+#if LOGIN_ENABLED
+    let authenticationDiagnostics: AuthenticationDiagnostics?
+    let onLogOutConfirmed: () -> Void
+#endif
     @State private var isAdvancedDiagnosticsExpanded = false
     @State private var selectedLogoPhotoItem: PhotosPickerItem?
     @State private var isPNGFileImporterPresented = false
+#if LOGIN_ENABLED
+    @State private var isLogoutConfirmationPresented = false
+#endif
     @FocusState private var focusedField: FocusedField?
+
+#if LOGIN_ENABLED
+    init(
+        viewModel: ESP32ControllerViewModel,
+        authenticationDiagnostics: AuthenticationDiagnostics?,
+        onLogOutConfirmed: @escaping () -> Void
+    ) {
+        self.viewModel = viewModel
+        self.authenticationDiagnostics = authenticationDiagnostics
+        self.onLogOutConfirmed = onLogOutConfirmed
+    }
+#else
+    init(viewModel: ESP32ControllerViewModel) {
+        self.viewModel = viewModel
+    }
+#endif
+
+    private var esp32DevicesSection: some View {
+        Section {
+            Button("Scan for ESP32 Devices") {
+                dismissKeyboard()
+                viewModel.presentDeviceScanner()
+            }
+
+            if let connectedDevice = viewModel.connectedDiscoveredDevice {
+                ConnectedDeviceSummary(
+                    device: connectedDevice,
+                    statusText: viewModel.connectionStatusText,
+                    healthAccessibilityValue: viewModel.connectionHealthAccessibilityValue
+                )
+            }
+
+            ConnectionStatusRow(
+                statusText: viewModel.connectionStatusText,
+                detail: viewModel.state.detail,
+                healthAccessibilityValue: viewModel.connectionHealthAccessibilityValue
+            )
+
+            if viewModel.canDisconnect {
+                Button("Disconnect", role: .destructive) {
+                    dismissKeyboard()
+                    viewModel.disconnect()
+                }
+            }
+        } header: {
+            Text("ESP32 Devices")
+        }
+    }
+
+    private var logoSection: some View {
+        Section("Logo") {
+            PhotosPicker(
+                selection: $selectedLogoPhotoItem,
+                matching: .images,
+                preferredItemEncoding: .current
+            ) {
+                Label("Choose Photo", systemImage: "photo")
+            }
+
+            LogoPreviewView(previewImage: viewModel.processedLogoPreview)
+
+            Button("Upload Logo") {
+                dismissKeyboard()
+                viewModel.uploadLogo()
+            }
+            .disabled(!viewModel.canUploadLogo)
+
+            Button("Restore Default Logo") {
+                dismissKeyboard()
+                viewModel.presentRestoreDefaultLogoConfirmation()
+            }
+            .disabled(!viewModel.canRestoreDefaultLogo)
+        }
+    }
+
+    private var clockControlsSection: some View {
+        Section("Clock Controls") {
+            Button("Sync Time") {
+                dismissKeyboard()
+                viewModel.syncDeviceTime()
+            }
+            .accessibilityLabel("Sync Time")
+            .accessibilityHint("Sets the ESP32 clock to the current date and time from this iPhone.")
+            .accessibilityValue(viewModel.timeSyncState.isConfirmationPending ? "Synchronizing" : "")
+            .disabled(!viewModel.canSyncTime)
+
+            Button("Next Display Mode") {
+                dismissKeyboard()
+                viewModel.requestNextDisplayMode()
+            }
+            .accessibilityLabel("Next Display Mode")
+            .accessibilityHint("Advances the ESP32 clock display to the next mode.")
+            .accessibilityValue(viewModel.displayModeChangeState.isConfirmationPending ? "Changing" : "")
+            .disabled(!viewModel.canRequestNextDisplayMode)
+
+            Picker("Time Format", selection: Binding(
+                get: { viewModel.is24HourFormat },
+                set: { newValue in
+                    dismissKeyboard()
+                    viewModel.userSelectedTimeFormat(newValue)
+                }
+            )) {
+                Text("12 Hour").tag(false)
+                Text("24 Hour").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .disabled(!viewModel.canUseClockControls)
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Brightness")
+                    Spacer()
+                    Text("\(Int(viewModel.brightnessLevel))")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                Slider(
+                    value: $viewModel.brightnessLevel,
+                    in: 1...10,
+                    step: 1,
+                    onEditingChanged: { isEditing in
+                        if isEditing {
+                            dismissKeyboard()
+                        }
+                        viewModel.brightnessEditingChanged(isEditing)
+                    }
+                )
+                    .disabled(!viewModel.canUseClockControls)
+            }
+
+            Button("Device Default Configuration", role: .destructive) {
+                dismissKeyboard()
+                viewModel.isResetConfirmationPresented = true
+            }
+            .accessibilityLabel("Device Default Configuration")
+            .disabled(!viewModel.canUseClockControls)
+        }
+    }
+
+    private var advancedDiagnosticsSection: some View {
+        DisclosureGroup("Advanced / Diagnostics", isExpanded: $isAdvancedDiagnosticsExpanded) {
+#if LOGIN_ENABLED
+            AdvancedDiagnosticsContent(
+                viewModel: viewModel,
+                authenticationDiagnostics: authenticationDiagnostics,
+                focusedField: $focusedField,
+                dismissKeyboard: dismissKeyboard,
+                presentPNGImporter: presentLogoPNGFileImporter,
+                presentLogoutConfirmation: {
+                    dismissKeyboard()
+                    isLogoutConfirmationPresented = true
+                }
+            )
+#else
+            AdvancedDiagnosticsContent(
+                viewModel: viewModel,
+                focusedField: $focusedField,
+                dismissKeyboard: dismissKeyboard,
+                presentPNGImporter: presentLogoPNGFileImporter
+            )
+#endif
+        }
+        .accessibilityLabel("Advanced / Diagnostics")
+        .accessibilityValue(isAdvancedDiagnosticsExpanded ? "Expanded" : "Collapsed")
+        .onChange(of: isAdvancedDiagnosticsExpanded) { _, isExpanded in
+            if !isExpanded, focusedField?.isAdvancedDiagnosticsField == true {
+                dismissKeyboard()
+            }
+        }
+    }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section {
-                    Button("Scan for ESP32 Devices") {
-                        dismissKeyboard()
-                        viewModel.presentDeviceScanner()
-                    }
-
-                    if let connectedDevice = viewModel.connectedDiscoveredDevice {
-                        ConnectedDeviceSummary(
-                            device: connectedDevice,
-                            statusText: viewModel.connectionStatusText,
-                            healthAccessibilityValue: viewModel.connectionHealthAccessibilityValue
-                        )
-                    }
-
-                    ConnectionStatusRow(
-                        statusText: viewModel.connectionStatusText,
-                        detail: viewModel.state.detail,
-                        healthAccessibilityValue: viewModel.connectionHealthAccessibilityValue
-                    )
-
-                    if viewModel.canDisconnect {
-                        Button("Disconnect", role: .destructive) {
-                            dismissKeyboard()
-                            viewModel.disconnect()
-                        }
-                    }
-                } header: {
-                    Text("ESP32 Devices")
-                }
-
-                Section("Logo") {
-                    PhotosPicker(
-                        selection: $selectedLogoPhotoItem,
-                        matching: .images,
-                        preferredItemEncoding: .current
-                    ) {
-                        Label("Choose Photo", systemImage: "photo")
-                    }
-
-                    LogoPreviewView(previewImage: viewModel.processedLogoPreview)
-
-                    Button("Upload Logo") {
-                        dismissKeyboard()
-                        viewModel.uploadLogo()
-                    }
-                    .disabled(!viewModel.canUploadLogo)
-
-                    Button("Restore Default Logo") {
-                        dismissKeyboard()
-                        viewModel.presentRestoreDefaultLogoConfirmation()
-                    }
-                    .disabled(!viewModel.canRestoreDefaultLogo)
-                }
-
-                Section("Clock Controls") {
-                    Button("Sync Time") {
-                        dismissKeyboard()
-                        viewModel.syncDeviceTime()
-                    }
-                    .accessibilityLabel("Sync Time")
-                    .accessibilityHint("Sets the ESP32 clock to the current date and time from this iPhone.")
-                    .accessibilityValue(viewModel.timeSyncState.isConfirmationPending ? "Synchronizing" : "")
-                    .disabled(!viewModel.canSyncTime)
-
-                    Button("Next Display Mode") {
-                        dismissKeyboard()
-                        viewModel.requestNextDisplayMode()
-                    }
-                    .accessibilityLabel("Next Display Mode")
-                    .accessibilityHint("Advances the ESP32 clock display to the next mode.")
-                    .accessibilityValue(viewModel.displayModeChangeState.isConfirmationPending ? "Changing" : "")
-                    .disabled(!viewModel.canRequestNextDisplayMode)
-
-                    Picker("Time Format", selection: Binding(
-                        get: { viewModel.is24HourFormat },
-                        set: { newValue in
-                            dismissKeyboard()
-                            viewModel.userSelectedTimeFormat(newValue)
-                        }
-                    )) {
-                        Text("12 Hour").tag(false)
-                        Text("24 Hour").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(!viewModel.canUseClockControls)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Brightness")
-                            Spacer()
-                            Text("\(Int(viewModel.brightnessLevel))")
-                                .font(.body.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Slider(
-                            value: $viewModel.brightnessLevel,
-                            in: 1...10,
-                            step: 1,
-                            onEditingChanged: { isEditing in
-                                if isEditing {
-                                    dismissKeyboard()
-                                }
-                                viewModel.brightnessEditingChanged(isEditing)
-                            }
-                        )
-                            .disabled(!viewModel.canUseClockControls)
-                    }
-
-                    Button("Device Default Configuration", role: .destructive) {
-                        dismissKeyboard()
-                        viewModel.isResetConfirmationPresented = true
-                    }
-                    .accessibilityLabel("Device Default Configuration")
-                    .disabled(!viewModel.canUseClockControls)
-                }
-
-                DisclosureGroup("Advanced / Diagnostics", isExpanded: $isAdvancedDiagnosticsExpanded) {
-                    AdvancedDiagnosticsContent(
-                        viewModel: viewModel,
-                        focusedField: $focusedField,
-                        dismissKeyboard: dismissKeyboard,
-                        presentPNGImporter: presentLogoPNGFileImporter
-                    )
-                }
-                .accessibilityLabel("Advanced / Diagnostics")
-                .accessibilityValue(isAdvancedDiagnosticsExpanded ? "Expanded" : "Collapsed")
-                .onChange(of: isAdvancedDiagnosticsExpanded) { _, isExpanded in
-                    if !isExpanded, focusedField?.isAdvancedDiagnosticsField == true {
-                        dismissKeyboard()
-                    }
-                }
+                esp32DevicesSection
+                logoSection
+                clockControlsSection
+                advancedDiagnosticsSection
             }
             .navigationTitle("ESP32 TCP")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    ControllerNavigationTitle()
+                }
+            }
             .confirmationDialog(
                 "Apply Device Default Configuration?",
                 isPresented: $viewModel.isResetConfirmationPresented,
@@ -248,6 +303,20 @@ struct ContentView: View {
             } message: {
                 Text(ESP32ControllerViewModel.defaultLogoRestoreSuccessMessage)
             }
+#if LOGIN_ENABLED
+            .alert(
+                "Log Out?",
+                isPresented: $isLogoutConfirmationPresented
+            ) {
+                Button("Cancel", role: .cancel) {}
+                Button("Log Out", role: .destructive) {
+                    dismissKeyboard()
+                    onLogOutConfirmed()
+                }
+            } message: {
+                Text("This disconnects from the ESP32 and returns to the login screen.")
+            }
+#endif
             .fileImporter(
                 isPresented: $isPNGFileImporterPresented,
                 allowedContentTypes: [.png],
@@ -283,24 +352,6 @@ struct ContentView: View {
                         }
                     }
                 }
-            }
-            .onAppear {
-                viewModel.handleAppBecameActive()
-            }
-            .onChange(of: scenePhase) { _, newPhase in
-                switch newPhase {
-                case .active:
-                    viewModel.handleAppBecameActive()
-                case .inactive:
-                    viewModel.handleAppBecameInactive()
-                case .background:
-                    viewModel.handleAppEnteredBackground()
-                @unknown default:
-                    viewModel.handleAppBecameInactive()
-                }
-            }
-            .onDisappear {
-                viewModel.stopDiscovery()
             }
             .sheet(isPresented: $viewModel.isScannerPresented) {
                 DeviceScannerSheet(viewModel: viewModel)
@@ -351,6 +402,23 @@ struct ContentView: View {
         }
 
         return try Data(contentsOf: url)
+    }
+}
+
+private struct ControllerNavigationTitle: View {
+    var body: some View {
+        HStack(spacing: 7) {
+            Text("ESP32 TCP")
+                .font(.headline)
+                .fontWeight(.semibold)
+                .lineLimit(1)
+                .minimumScaleFactor(0.95)
+                .accessibilityAddTraits(.isHeader)
+
+            ZeitBrandBadge(width: 54, isDecorative: true)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("ESP32 TCP")
     }
 }
 
@@ -550,9 +618,15 @@ private struct ConnectionStatusRow: View {
 
 private struct AdvancedDiagnosticsContent: View {
     @ObservedObject var viewModel: ESP32ControllerViewModel
+#if LOGIN_ENABLED
+    let authenticationDiagnostics: AuthenticationDiagnostics?
+#endif
     let focusedField: FocusState<FocusedField?>.Binding
     let dismissKeyboard: () -> Void
     let presentPNGImporter: () -> Void
+#if LOGIN_ENABLED
+    let presentLogoutConfirmation: () -> Void
+#endif
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -607,6 +681,14 @@ private struct AdvancedDiagnosticsContent: View {
             communicationLog
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Communication Log")
+
+#if LOGIN_ENABLED
+            Divider()
+
+            authenticationControls
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Authentication")
+#endif
         }
         .padding(.vertical, 4)
     }
@@ -853,6 +935,37 @@ private struct AdvancedDiagnosticsContent: View {
             }
         }
     }
+
+#if LOGIN_ENABLED
+    private var authenticationControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Authentication")
+                .font(.headline)
+
+            if let authenticationDiagnostics {
+                LabeledContent("Authentication", value: authenticationDiagnostics.provider)
+                LabeledContent("User", value: authenticationDiagnostics.username)
+                LabeledContent("Role", value: authenticationDiagnostics.role.rawValue)
+                LabeledContent("Server", value: authenticationDiagnostics.server)
+                LabeledContent("Session", value: authenticationDiagnostics.sessionStatus)
+                if let expiresAt = authenticationDiagnostics.expiresAt {
+                    LabeledContent("Expires", value: Self.expirationFormatter.string(from: expiresAt))
+                }
+            }
+
+            Button("Log Out", role: .destructive) {
+                presentLogoutConfirmation()
+            }
+        }
+    }
+
+    private static let expirationFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+#endif
 }
 
 private struct ConnectedDeviceSummary: View {
@@ -1085,5 +1198,13 @@ private struct CommunicationLogRow: View {
 }
 
 #Preview {
-    ContentView()
+#if LOGIN_ENABLED
+    ContentView(
+        viewModel: ESP32ControllerViewModel(),
+        authenticationDiagnostics: nil,
+        onLogOutConfirmed: {}
+    )
+#else
+    ContentView(viewModel: ESP32ControllerViewModel())
+#endif
 }
