@@ -357,13 +357,55 @@ final class ESP32TCPClient {
     }
 
     private func emitDelimitedFrames() {
-        while let delimiterIndex = receiveBuffer.firstIndex(of: Self.frameDelimiter) {
-            let frame = Array(receiveBuffer[...delimiterIndex])
-            receiveBuffer.removeSubrange(...delimiterIndex)
-            if !handleHeartbeatACKFrame(frame) {
-                onFrameReceived?(frame)
+        while !receiveBuffer.isEmpty {
+            switch exactLengthFramePrefixStatus(in: receiveBuffer) {
+            case let .complete(length):
+                let frame = Array(receiveBuffer.prefix(length))
+                receiveBuffer.removeFirst(length)
+                if !handleHeartbeatACKFrame(frame) {
+                    onFrameReceived?(frame)
+                }
+            case .incomplete:
+                return
+            case .notExactLength:
+                guard let delimiterIndex = receiveBuffer.firstIndex(of: Self.frameDelimiter) else {
+                    return
+                }
+
+                let frame = Array(receiveBuffer[...delimiterIndex])
+                receiveBuffer.removeSubrange(...delimiterIndex)
+                if !handleHeartbeatACKFrame(frame) {
+                    onFrameReceived?(frame)
+                }
             }
         }
+    }
+
+    private enum ExactLengthFramePrefixStatus {
+        case complete(Int)
+        case incomplete
+        case notExactLength
+    }
+
+    private func exactLengthFramePrefixStatus(in buffer: [UInt8]) -> ExactLengthFramePrefixStatus {
+        guard buffer.count >= 6 else {
+            return .notExactLength
+        }
+
+        if buffer[0] == 0x2F,
+           buffer[1] == 0x74,
+           buffer[2] == 0x61,
+           buffer[4] == 0x6C,
+           buffer[5] == 0x61 {
+            let alarmResponseLength = 12
+            guard buffer.count >= alarmResponseLength else {
+                return .incomplete
+            }
+
+            return buffer[alarmResponseLength - 1] == Self.frameDelimiter ? .complete(alarmResponseLength) : .notExactLength
+        }
+
+        return .notExactLength
     }
 
     private func isActiveConnection(_ connectionID: UUID, connection: TCPConnection) -> Bool {

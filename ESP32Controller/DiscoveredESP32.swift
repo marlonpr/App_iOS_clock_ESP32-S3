@@ -8,6 +8,16 @@
 import Foundation
 import Network
 
+extension String {
+    var removingESP32PresentationPrefix: String {
+        guard hasPrefix("ESP32 ") else {
+            return self
+        }
+
+        return String(dropFirst("ESP32 ".count))
+    }
+}
+
 enum ESP32LivenessState: Equatable {
     case unknown
     case checking
@@ -81,5 +91,9 @@ struct DiscoveredESP32: Identifiable, Equatable {
 
     var stableEndpointDescription: String {
         String(describing: endpoint)
+    }
+
+    var presentedServiceName: String {
+        serviceName.removingESP32PresentationPrefix
     }
 }

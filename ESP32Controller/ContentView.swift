@@ -9,6 +9,35 @@ import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum MainControlBottomAction: Equatable {
+    case clockFactoryReset
+#if LOGIN_ENABLED
+    case logOut
+#endif
+    case advancedDiagnostics
+
+    var title: String {
+        switch self {
+        case .clockFactoryReset:
+            "Clock Factory Reset"
+#if LOGIN_ENABLED
+        case .logOut:
+            "Log Out"
+#endif
+        case .advancedDiagnostics:
+            "Advanced / Diagnostics"
+        }
+    }
+
+    static var visibleActions: [MainControlBottomAction] {
+#if LOGIN_ENABLED
+        [.clockFactoryReset, .logOut, .advancedDiagnostics]
+#else
+        [.clockFactoryReset, .advancedDiagnostics]
+#endif
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var viewModel: ESP32ControllerViewModel
 #if LOGIN_ENABLED
@@ -41,33 +70,45 @@ struct ContentView: View {
 
     private var esp32DevicesSection: some View {
         Section {
-            Button("Scan for ESP32 Devices") {
+            let presentation = viewModel.clockDevicesSectionPresentation
+
+            Button("Scan for CLOCK Devices") {
                 dismissKeyboard()
                 viewModel.presentDeviceScanner()
             }
 
-            if let connectedDevice = viewModel.connectedDiscoveredDevice {
-                ConnectedDeviceSummary(
-                    device: connectedDevice,
-                    statusText: viewModel.connectionStatusText,
-                    healthAccessibilityValue: viewModel.connectionHealthAccessibilityValue
-                )
+            if let connectedName = presentation.deviceName {
+                LabeledContent(presentation.deviceLabel) {
+                    Text(connectedName)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(presentation.deviceNameStyle.foregroundStyle)
+                }
             }
 
             ConnectionStatusRow(
-                statusText: viewModel.connectionStatusText,
+                label: presentation.stateLabel,
+                statusText: presentation.stateText,
+                stateStyle: presentation.stateStyle,
                 detail: viewModel.state.detail,
                 healthAccessibilityValue: viewModel.connectionHealthAccessibilityValue
             )
 
-            if viewModel.canDisconnect {
-                Button("Disconnect", role: .destructive) {
-                    dismissKeyboard()
-                    viewModel.disconnect()
-                }
+            switch presentation.action {
+            case .disconnect:
+                Button("Disconnect", role: .destructive, action: disconnectFromClock)
+            case .connect:
+                Button("Connect", action: connectToRememberedClock)
+                    .tint(.blue)
+                    .disabled(!viewModel.canConnectRememberedDevice)
+            case .connecting:
+                Button("Connecting...") {}
+                    .tint(.blue)
+                    .disabled(true)
+            case nil:
+                EmptyView()
             }
         } header: {
-            Text("ESP32 Devices")
+            Text("CLOCK Devices")
         }
     }
 
@@ -104,7 +145,7 @@ struct ContentView: View {
                 viewModel.syncDeviceTime()
             }
             .accessibilityLabel("Sync Time")
-            .accessibilityHint("Sets the ESP32 clock to the current date and time from this iPhone.")
+            .accessibilityHint("Sets the CLOCK to the current date and time from this iPhone.")
             .accessibilityValue(viewModel.timeSyncState.isConfirmationPending ? "Synchronizing" : "")
             .disabled(!viewModel.canSyncTime)
 
@@ -113,7 +154,7 @@ struct ContentView: View {
                 viewModel.requestNextDisplayMode()
             }
             .accessibilityLabel("Next Display Mode")
-            .accessibilityHint("Advances the ESP32 clock display to the next mode.")
+            .accessibilityHint("Advances the CLOCK display to the next mode.")
             .accessibilityValue(viewModel.displayModeChangeState.isConfirmationPending ? "Changing" : "")
             .disabled(!viewModel.canRequestNextDisplayMode)
 
@@ -153,28 +194,33 @@ struct ContentView: View {
                     .disabled(!viewModel.canUseClockControls)
             }
 
-            Button("Device Default Configuration", role: .destructive) {
-                dismissKeyboard()
-                viewModel.isResetConfirmationPresented = true
-            }
-            .accessibilityLabel("Device Default Configuration")
-            .disabled(!viewModel.canUseClockControls)
         }
     }
 
+    private var alarmSection: some View {
+        AlarmSectionView(viewModel: viewModel)
+    }
+
+    private var alarmEditorDraftBinding: Binding<AlarmDraft?> {
+        Binding(
+            get: { viewModel.alarmEditorDraft },
+            set: { newValue in
+                if newValue == nil {
+                    viewModel.cancelAlarmEditing()
+                }
+            }
+        )
+    }
+
     private var advancedDiagnosticsSection: some View {
-        DisclosureGroup("Advanced / Diagnostics", isExpanded: $isAdvancedDiagnosticsExpanded) {
+        DisclosureGroup(MainControlBottomAction.advancedDiagnostics.title, isExpanded: $isAdvancedDiagnosticsExpanded) {
 #if LOGIN_ENABLED
             AdvancedDiagnosticsContent(
                 viewModel: viewModel,
                 authenticationDiagnostics: authenticationDiagnostics,
                 focusedField: $focusedField,
                 dismissKeyboard: dismissKeyboard,
-                presentPNGImporter: presentLogoPNGFileImporter,
-                presentLogoutConfirmation: {
-                    dismissKeyboard()
-                    isLogoutConfirmationPresented = true
-                }
+                presentPNGImporter: presentLogoPNGFileImporter
             )
 #else
             AdvancedDiagnosticsContent(
@@ -185,7 +231,7 @@ struct ContentView: View {
             )
 #endif
         }
-        .accessibilityLabel("Advanced / Diagnostics")
+        .accessibilityLabel(MainControlBottomAction.advancedDiagnostics.title)
         .accessibilityValue(isAdvancedDiagnosticsExpanded ? "Expanded" : "Collapsed")
         .onChange(of: isAdvancedDiagnosticsExpanded) { _, isExpanded in
             if !isExpanded, focusedField?.isAdvancedDiagnosticsField == true {
@@ -194,15 +240,34 @@ struct ContentView: View {
         }
     }
 
+    private var bottomActionsSection: some View {
+        Section {
+            Button(MainControlBottomAction.clockFactoryReset.title, role: .destructive) {
+                presentClockFactoryResetConfirmation()
+            }
+            .accessibilityLabel(MainControlBottomAction.clockFactoryReset.title)
+            .disabled(!viewModel.canUseClockControls)
+
+#if LOGIN_ENABLED
+            Button(MainControlBottomAction.logOut.title, role: .destructive) {
+                presentLogoutConfirmation()
+            }
+            .accessibilityLabel(MainControlBottomAction.logOut.title)
+#endif
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
                 esp32DevicesSection
-                logoSection
                 clockControlsSection
+                alarmSection
+                logoSection
+                bottomActionsSection
                 advancedDiagnosticsSection
             }
-            .navigationTitle("ESP32 TCP")
+            .navigationTitle("CLOCK TCP")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .principal) {
@@ -303,6 +368,23 @@ struct ContentView: View {
             } message: {
                 Text(ESP32ControllerViewModel.defaultLogoRestoreSuccessMessage)
             }
+            .alert(
+                viewModel.rememberedDeviceConnectionFailureAlert?.title ?? "Device Not Found",
+                isPresented: Binding(
+                    get: { viewModel.rememberedDeviceConnectionFailureAlert != nil },
+                    set: { isPresented in
+                        if !isPresented {
+                            viewModel.dismissRememberedDeviceConnectionFailureAlert()
+                        }
+                    }
+                )
+            ) {
+                Button("OK") {
+                    viewModel.dismissRememberedDeviceConnectionFailureAlert()
+                }
+            } message: {
+                Text(viewModel.rememberedDeviceConnectionFailureAlert?.message ?? "")
+            }
 #if LOGIN_ENABLED
             .alert(
                 "Log Out?",
@@ -314,7 +396,7 @@ struct ContentView: View {
                     onLogOutConfirmed()
                 }
             } message: {
-                Text("This disconnects from the ESP32 and returns to the login screen.")
+                Text("This disconnects from the CLOCK and returns to the login screen.")
             }
 #endif
             .fileImporter(
@@ -356,7 +438,32 @@ struct ContentView: View {
             .sheet(isPresented: $viewModel.isScannerPresented) {
                 DeviceScannerSheet(viewModel: viewModel)
             }
+            .sheet(item: alarmEditorDraftBinding) { draft in
+                alarmEditorSheet(for: draft)
+            }
         }
+    }
+
+    private func alarmEditorSheet(for draft: AlarmDraft) -> some View {
+        AlarmEditorView(
+            initialDraft: draft,
+            sendState: viewModel.alarmSendState,
+            deleteState: viewModel.alarmDeleteState,
+            canSend: viewModel.canSendAlarm,
+            canDelete: viewModel.canDeleteAlarm,
+            onSend: { draft in
+                dismissKeyboard()
+                viewModel.sendAlarm(draft)
+            },
+            onDelete: { draft in
+                dismissKeyboard()
+                viewModel.deleteAlarm(draft)
+            },
+            onCancel: {
+                dismissKeyboard()
+                viewModel.cancelAlarmEditing()
+            }
+        )
     }
 
     private func dismissKeyboard() {
@@ -366,6 +473,28 @@ struct ContentView: View {
     private func presentLogoPNGFileImporter() {
         dismissKeyboard()
         isPNGFileImporterPresented = true
+    }
+
+    private func presentClockFactoryResetConfirmation() {
+        dismissKeyboard()
+        viewModel.isResetConfirmationPresented = true
+    }
+
+#if LOGIN_ENABLED
+    private func presentLogoutConfirmation() {
+        dismissKeyboard()
+        isLogoutConfirmationPresented = true
+    }
+#endif
+
+    private func connectToRememberedClock() {
+        dismissKeyboard()
+        viewModel.connectToRememberedDevice()
+    }
+
+    private func disconnectFromClock() {
+        dismissKeyboard()
+        viewModel.disconnect()
     }
 
     private func handleLogoPNGFileImport(_ result: Result<[URL], Error>) {
@@ -408,7 +537,7 @@ struct ContentView: View {
 private struct ControllerNavigationTitle: View {
     var body: some View {
         HStack(spacing: 7) {
-            Text("ESP32 TCP")
+            Text("CLOCK TCP")
                 .font(.headline)
                 .fontWeight(.semibold)
                 .lineLimit(1)
@@ -418,7 +547,7 @@ private struct ControllerNavigationTitle: View {
             ZeitBrandBadge(width: 54, isDecorative: true)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("ESP32 TCP")
+        .accessibilityLabel("CLOCK TCP")
     }
 }
 
@@ -588,17 +717,20 @@ private enum FocusedField: Hashable {
 }
 
 private struct ConnectionStatusRow: View {
+    let label: String
     let statusText: String
+    let stateStyle: ClockDevicesStateStyle
     let detail: String?
     let healthAccessibilityValue: String
 
     var body: some View {
         HStack {
-            Text("State")
+            Text(label)
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
                 Text(statusText)
                     .fontWeight(.semibold)
+                    .foregroundStyle(stateStyle.foregroundStyle)
                     .frame(minWidth: 210, alignment: .trailing)
                     .transaction { transaction in
                         transaction.animation = nil
@@ -616,6 +748,30 @@ private struct ConnectionStatusRow: View {
     }
 }
 
+private extension ClockDevicesTextStyle {
+    var foregroundStyle: Color {
+        switch self {
+        case .primary:
+            .primary
+        }
+    }
+}
+
+private extension ClockDevicesStateStyle {
+    var foregroundStyle: Color {
+        switch self {
+        case .connected:
+            .green
+        case .disconnected:
+            .gray
+        case .connecting:
+            .orange
+        case .failed:
+            .red
+        }
+    }
+}
+
 private struct AdvancedDiagnosticsContent: View {
     @ObservedObject var viewModel: ESP32ControllerViewModel
 #if LOGIN_ENABLED
@@ -624,9 +780,6 @@ private struct AdvancedDiagnosticsContent: View {
     let focusedField: FocusState<FocusedField?>.Binding
     let dismissKeyboard: () -> Void
     let presentPNGImporter: () -> Void
-#if LOGIN_ENABLED
-    let presentLogoutConfirmation: () -> Void
-#endif
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -666,6 +819,12 @@ private struct AdvancedDiagnosticsContent: View {
 
             Divider()
 
+            alarmDiagnostics
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Alarm Diagnostics")
+
+            Divider()
+
             logoDiagnostics
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Logo Diagnostics")
@@ -675,12 +834,6 @@ private struct AdvancedDiagnosticsContent: View {
             commandStatus
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Command Status")
-
-            Divider()
-
-            communicationLog
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Communication Log")
 
 #if LOGIN_ENABLED
             Divider()
@@ -895,6 +1048,45 @@ private struct AdvancedDiagnosticsContent: View {
         }
     }
 
+    private var alarmDiagnostics: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Alarm Diagnostics")
+                .font(.headline)
+
+            LabeledContent("Alarm Read State") {
+                Text(viewModel.alarmReadDiagnosticsText)
+            }
+
+            LabeledContent("Alarm Read Progress") {
+                Text(viewModel.alarmReadProgressDiagnosticsText)
+            }
+
+            LabeledContent("Last Alarm Read") {
+                Text(viewModel.lastAlarmReadDiagnosticsText)
+            }
+
+            LabeledContent("Alarm Read Failures") {
+                Text(viewModel.alarmReadFailuresDiagnosticsText)
+            }
+
+            LabeledContent("Last CA Alarm ID") {
+                Text(viewModel.lastCAAlarmIDDiagnosticsText)
+            }
+
+            LabeledContent("Last CA Result") {
+                Text(viewModel.lastCAResultDiagnosticsText)
+            }
+
+            LabeledContent("Last DA Alarm ID") {
+                Text(viewModel.lastDAAlarmIDDiagnosticsText)
+            }
+
+            LabeledContent("Last DA Result") {
+                Text(viewModel.lastDAResultDiagnosticsText)
+            }
+        }
+    }
+
     private var commandStatus: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Command Status")
@@ -953,9 +1145,6 @@ private struct AdvancedDiagnosticsContent: View {
                 }
             }
 
-            Button("Log Out", role: .destructive) {
-                presentLogoutConfirmation()
-            }
         }
     }
 
@@ -966,34 +1155,6 @@ private struct AdvancedDiagnosticsContent: View {
         return formatter
     }()
 #endif
-}
-
-private struct ConnectedDeviceSummary: View {
-    let device: DiscoveredESP32
-    let statusText: String
-    let healthAccessibilityValue: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(device.serviceName)
-                    .fontWeight(.semibold)
-                Spacer()
-                Text(statusText)
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.green)
-                    .frame(minWidth: 190, alignment: .trailing)
-                    .transaction { transaction in
-                        transaction.animation = nil
-                    }
-                    .accessibilityValue(healthAccessibilityValue)
-            }
-
-            DeviceMetadata(device: device)
-        }
-        .padding(.vertical, 4)
-    }
 }
 
 private struct DeviceScannerSheet: View {
@@ -1010,12 +1171,12 @@ private struct DeviceScannerSheet: View {
                     case .scanning:
                         HStack(spacing: 12) {
                             ProgressView()
-                            Text("Scanning for ESP32 devices...")
+                            Text("Scanning for CLOCK devices...")
                                 .foregroundStyle(.secondary)
                         }
                     case .completed:
                         if viewModel.discoveredDevices.isEmpty {
-                            Text("No ESP32 devices found.")
+                            Text("No CLOCK devices found.")
                                 .foregroundStyle(.secondary)
                         }
                     case let .failed(error):
@@ -1049,7 +1210,7 @@ private struct DeviceScannerSheet: View {
                     }
                 }
             }
-            .navigationTitle("ESP32 Devices")
+            .navigationTitle("CLOCK Devices")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") {
@@ -1087,31 +1248,28 @@ private struct ScannerDeviceRow: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(device.serviceName)
-                            .fontWeight(.semibold)
+                    Text(device.presentedServiceName)
+                        .fontWeight(.semibold)
 
-                        if isConnected {
-                            Text(connectedStatusText)
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                                .foregroundStyle(.green)
-                                .frame(minWidth: 190, alignment: .leading)
-                                .transaction { transaction in
-                                    transaction.animation = nil
-                                }
-                                .accessibilityValue(connectedHealthAccessibilityValue)
-                        } else if isPending {
-                            Text("Connecting...")
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                                .foregroundStyle(.orange)
-                        } else {
-                            Text("Online")
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                                .foregroundStyle(.green)
-                        }
+                    if isConnected {
+                        Text(connectedStatusText)
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.green)
+                            .transaction { transaction in
+                                transaction.animation = nil
+                            }
+                            .accessibilityValue(connectedHealthAccessibilityValue)
+                    } else if isPending {
+                        Text("Connecting...")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.orange)
+                    } else {
+                        Text("Online")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.green)
                     }
 
                     DeviceMetadata(device: device)

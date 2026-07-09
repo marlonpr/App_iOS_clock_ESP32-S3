@@ -57,6 +57,19 @@ final class ESP32ControllerViewModel: ObservableObject {
     @Published private(set) var processedLogoPreview: CGImage?
     @Published private(set) var logoSourceDiagnostics: LogoImageSourceDiagnostics?
     @Published private(set) var isLogoUploadSuccessAlertPresented = false
+    @Published private(set) var rememberedDeviceConnectionFailureAlert: DeviceConnectionFailureAlert?
+    @Published private(set) var alarmRecords: [AlarmRecord] = AlarmRecord.makeDefaultRecords()
+    @Published private(set) var selectedAlarmID: Int?
+    @Published var alarmEditorDraft: AlarmDraft?
+    @Published private(set) var alarmReadOperationState: AlarmReadOperationState = .idle
+    @Published private(set) var alarmSendState: AlarmSendState = .idle
+    @Published private(set) var alarmDeleteState: AlarmDeleteState = .idle
+    @Published private(set) var lastAlarmReadID: Int?
+    @Published private(set) var alarmReadFailures = 0
+    @Published private(set) var lastCAAlarmID: Int?
+    @Published private(set) var lastCAResultText = "None"
+    @Published private(set) var lastDAAlarmID: Int?
+    @Published private(set) var lastDAResultText = "None"
     @Published private(set) var lastConnectedDevice: LastConnectedDevice?
     @Published private(set) var discoveredLogoUploadEndpoints: [DiscoveredLogoUploadEndpoint] = []
     @Published private(set) var appPhaseDiagnosticsText = "Inactive"
@@ -67,21 +80,27 @@ final class ESP32ControllerViewModel: ObservableObject {
     @Published private(set) var isNetworkingAuthorized = false
 
     nonisolated static let reservedBoardIDMessage = "Board ID 92 is reserved because it equals the protocol frame delimiter 0x5C."
-    nonisolated static let defaultLogoRestoreConfirmationMessage = "This removes the uploaded logo from the SD card and activates the logo built into the ESP32."
-    nonisolated static let defaultLogoRestoreSuccessMessage = "The logo built into the ESP32 is now active."
-    nonisolated static let defaultLogoRestoreTimeoutMessage = "Default-logo restore was not confirmed by the ESP32."
-    nonisolated static let deviceDefaultConfigurationConfirmationMessage = "This sends only the device default-configuration command to the connected ESP32. The ESP32 also restores the compiled default logo built into its firmware."
+    nonisolated static let defaultLogoRestoreConfirmationMessage = "This removes the uploaded logo from the SD card and activates the logo built into the CLOCK."
+    nonisolated static let defaultLogoRestoreSuccessMessage = "The logo built into the CLOCK is now active."
+    nonisolated static let defaultLogoRestoreTimeoutMessage = "Default-logo restore was not confirmed by the CLOCK."
+    nonisolated static let deviceDefaultConfigurationConfirmationMessage = "This sends only the device default-configuration command to the connected CLOCK. The CLOCK also restores the compiled default logo built into its firmware."
     nonisolated static let timeSyncCompensation: TimeInterval = 1.0
     nonisolated static let timeSyncConfirmationTimeout: TimeInterval = 4
     nonisolated static let defaultLogoRestoreConfirmationTimeout: TimeInterval = 4
+    nonisolated static let alarmTransactionTimeout: TimeInterval = 4
     nonisolated static let foregroundHeartbeatValidationTimeout: TimeInterval = 1.75
     nonisolated static let automaticReconnectDelays: [TimeInterval] = [0, 0.5, 1, 2]
+    nonisolated static let automaticReconnectDeadline: TimeInterval = 12
+    nonisolated static let startupAutomaticReconnectMaxAttempts = 2
+    nonisolated static let manualRememberedConnectionDeadline: TimeInterval = 12
+    nonisolated static let manualRememberedConnectionMaxAttempts = 2
 
     private let client: ESP32TCPClient
     private let discoveryService: ESP32DiscoveryService
     private let currentDateProvider: () -> Date
     private let timeSyncScheduler: TimeSyncScheduler
     private let reconnectScheduler: TimeSyncScheduler
+    private let manualConnectScheduler: TimeSyncScheduler
     private let logoImageConverter: LogoConversion
     private let logoUploadClient: ESP32LogoUploadClient
     private let userDefaults: UserDefaults
@@ -102,8 +121,15 @@ final class ESP32ControllerViewModel: ObservableObject {
     private var automaticReconnectEnabled = true
     private var userRequestedDisconnect = false
     private var automaticReconnectGeneration: UUID?
+    private var automaticReconnectIntent: AutomaticReconnectIntent?
     private var automaticReconnectTasks: [CancellableTask] = []
+    private var automaticReconnectDeadlineTask: CancellableTask?
     private var automaticReconnectLastStartedAttemptIndex: Int?
+    private var automaticReconnectLastScheduledAttemptIndex: Int?
+    private var automaticReconnectAttemptLimit = 0
+    private var didEvaluateStartupReconnectForAuthorization = false
+    private var suppressAutomaticReconnectUntilInactive = false
+    private var manualRememberedConnectionOperation: ManualRememberedConnectionOperation?
     private var foregroundValidationGeneration: UUID?
     private var foregroundValidationConnectionGeneration: UUID?
     private var didValidateActiveConnectionGeneration: UUID?
@@ -128,6 +154,25 @@ final class ESP32ControllerViewModel: ObservableObject {
     private var pendingLogoUploadOperationID: UUID?
     private var pendingLogoUploadConnectionGeneration: UUID?
     private var pendingLogoUploadBoardID: UInt8?
+    private var pendingAlarmReadOperationID: UUID?
+    private var pendingAlarmReadConnectionGeneration: UUID?
+    private var pendingAlarmReadBoardID: UInt8?
+    private var pendingAlarmReadID: Int?
+    private var pendingAlarmReadQueue: [Int] = []
+    private var pendingAlarmReadTotal = 0
+    private var alarmReadSuccesses = 0
+    private var alarmReadTimeoutTask: CancellableTask?
+    private var pendingAlarmWriteOperationID: UUID?
+    private var pendingAlarmWriteConnectionGeneration: UUID?
+    private var pendingAlarmWriteBoardID: UInt8?
+    private var pendingAlarmWriteDraft: AlarmDraft?
+    private var pendingAlarmWriteFrame: AlarmCAFrame?
+    private var alarmWriteTimeoutTask: CancellableTask?
+    private var pendingAlarmDeleteOperationID: UUID?
+    private var pendingAlarmDeleteConnectionGeneration: UUID?
+    private var pendingAlarmDeleteBoardID: UInt8?
+    private var pendingAlarmDeleteID: Int?
+    private var alarmDeleteTimeoutTask: CancellableTask?
     private var cancellables: Set<AnyCancellable> = []
 
     var canConnect: Bool {
@@ -186,6 +231,59 @@ final class ESP32ControllerViewModel: ObservableObject {
         return true
     }
 
+    var canReadAlarms: Bool {
+        canUseClockControls &&
+            !alarmReadOperationState.isReading &&
+            !alarmSendState.isSending &&
+            !alarmDeleteState.isDeleting
+    }
+
+    var canSendAlarm: Bool {
+        canUseClockControls &&
+            !alarmSendState.isSending &&
+            !alarmDeleteState.isDeleting &&
+            !alarmReadOperationState.isReading
+    }
+
+    var canDeleteAlarm: Bool {
+        canUseClockControls &&
+            !alarmSendState.isSending &&
+            !alarmDeleteState.isDeleting &&
+            !alarmReadOperationState.isReading
+    }
+
+    var alarmReadDiagnosticsText: String {
+        alarmReadOperationState.diagnosticsText
+    }
+
+    var alarmReadProgressDiagnosticsText: String {
+        alarmReadOperationState.progressText
+    }
+
+    var lastAlarmReadDiagnosticsText: String {
+        lastAlarmReadID.map(String.init) ?? "None"
+    }
+
+    var alarmReadFailuresDiagnosticsText: String {
+        "\(alarmReadFailures)"
+    }
+
+    var lastCAAlarmIDDiagnosticsText: String {
+        lastCAAlarmID.map(String.init) ?? "None"
+    }
+
+    var lastCAResultDiagnosticsText: String {
+        lastCAResultText
+    }
+
+    var lastDAAlarmIDDiagnosticsText: String {
+        lastDAAlarmID.map(String.init) ?? "None"
+    }
+
+    var lastDAResultDiagnosticsText: String {
+        lastDAResultText
+    }
+
     var canRestoreDefaultLogo: Bool {
         guard
             canUseClockControls,
@@ -208,7 +306,50 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     var lastDeviceDiagnosticsText: String {
-        lastConnectedDevice?.displayName ?? "None"
+        lastConnectedDevice?.presentedDisplayName ?? "None"
+    }
+
+    var connectedDevicePresentedName: String? {
+        connectedDiscoveredDevice?.presentedServiceName ?? lastConnectedDevice?.presentedDisplayName
+    }
+
+    var clockDevicesSectionPresentation: ClockDevicesSectionPresentation {
+        let action: ClockDevicesAction?
+        if isRememberedDeviceConnectionPending || automaticReconnectGeneration != nil {
+            action = .connecting
+        } else if state == .connected, canDisconnect {
+            action = .disconnect
+        } else if canConnectRememberedDevice {
+            action = .connect
+        } else {
+            action = nil
+        }
+
+        return ClockDevicesSectionPresentation(
+            deviceName: connectedDevicePresentedName,
+            deviceNameStyle: .primary,
+            stateText: connectionStatusText,
+            stateStyle: ClockDevicesStateStyle(connectionState: state),
+            action: action
+        )
+    }
+
+    var canConnectRememberedDevice: Bool {
+        guard
+            isNetworkingAuthorized,
+            lastConnectedDevice != nil,
+            automaticReconnectGeneration == nil,
+            !isConnectionAttemptPending
+        else {
+            return false
+        }
+
+        switch state {
+        case .disconnected, .failed:
+            return true
+        case .connecting, .connected:
+            return false
+        }
     }
 
     var autoReconnectDiagnosticsText: String {
@@ -241,7 +382,7 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     var clockControlsUnavailableMessage: String? {
         guard state == .connected else {
-            return "Connect to an ESP32 before using clock controls."
+            return "Connect to a CLOCK before using clock controls."
         }
 
         guard connectedProtocolBoardID != nil else {
@@ -253,7 +394,7 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     var connectionStatusText: String {
         if shouldShowAutomaticReconnectStatus, let lastConnectedDevice {
-            return "Reconnecting to \(lastConnectedDevice.displayName)…"
+            return "Reconnecting to \(lastConnectedDevice.presentedDisplayName)…"
         }
 
         switch state {
@@ -306,6 +447,11 @@ final class ESP32ControllerViewModel: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
             return ViewModelDispatchWorkItemCancellable(workItem: workItem)
         },
+        manualConnectScheduler: @escaping TimeSyncScheduler = { delay, callback in
+            let workItem = DispatchWorkItem(block: callback)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+            return ViewModelDispatchWorkItemCancellable(workItem: workItem)
+        },
         logoImageConverter: @escaping LogoConversion = { data, source in
             try LogoImageConverter().convert(data: data, source: source)
         },
@@ -317,6 +463,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         self.currentDateProvider = currentDateProvider
         self.timeSyncScheduler = timeSyncScheduler
         self.reconnectScheduler = reconnectScheduler
+        self.manualConnectScheduler = manualConnectScheduler
         self.logoImageConverter = logoImageConverter
         self.logoUploadClient = logoUploadClient ?? ESP32LogoUploadClient()
         self.userDefaults = userDefaults
@@ -332,9 +479,9 @@ final class ESP32ControllerViewModel: ObservableObject {
                     return
                 }
 
-                self.handleConnectionStateChange(state)
+                let presentationState = self.handleConnectionStateChange(state)
 
-                self.state = state
+                self.state = presentationState
                 self.appendEvent(state.title)
             }
         }
@@ -406,7 +553,12 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     deinit {
         automaticReconnectTasks.forEach { $0.cancel() }
+        automaticReconnectDeadlineTask?.cancel()
+        manualRememberedConnectionOperation?.deadlineTask?.cancel()
         logoConversionTask?.cancel()
+        alarmReadTimeoutTask?.cancel()
+        alarmWriteTimeoutTask?.cancel()
+        alarmDeleteTimeoutTask?.cancel()
     }
 
     func authorizeNetworking() {
@@ -417,6 +569,8 @@ final class ESP32ControllerViewModel: ObservableObject {
         isNetworkingAuthorized = true
         automaticReconnectEnabled = true
         userRequestedDisconnect = false
+        didEvaluateStartupReconnectForAuthorization = false
+        suppressAutomaticReconnectUntilInactive = false
     }
 
     func revokeNetworkingAuthorization() {
@@ -457,10 +611,12 @@ final class ESP32ControllerViewModel: ObservableObject {
             return
         }
 
+        let reconnectIntent = nextAutomaticReconnectIntentForActiveScene()
+
         if state == .connected {
             validateForegroundConnectionIfNeeded()
         } else {
-            startAutomaticReconnectIfPossible()
+            startAutomaticReconnectIfPossible(intent: reconnectIntent)
         }
     }
 
@@ -478,11 +634,13 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         isAppActive = false
+        suppressAutomaticReconnectUntilInactive = false
         appPhaseDiagnosticsText = "Background"
         foregroundReconnectRequired = true
         foregroundValidationDiagnosticsText = "Idle"
         cancelForegroundValidation()
         cancelAutomaticReconnect(resetDiagnostics: true)
+        cancelManualRememberedConnectionOperation()
         resumeActionDiagnosticsText = "Backgrounded"
         discoveryService.pauseDiscoveryPreservingCache()
 
@@ -491,6 +649,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         clearDefaultLogoRestoreStateForConnectionChange()
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
+        clearAlarmOperationsForConnectionChange(markInterrupted: true)
         activeConnectionGeneration = nil
         connectionAttempt = .idle
         isExpectingInitialDisconnect = false
@@ -553,6 +712,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         cancelAutomaticReconnect(resetDiagnostics: true)
+        cancelManualRememberedConnectionOperation()
         cancelForegroundValidation()
         userRequestedDisconnect = false
         automaticReconnectEnabled = true
@@ -595,6 +755,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         cancelAutomaticReconnect(resetDiagnostics: true)
+        cancelManualRememberedConnectionOperation()
         cancelForegroundValidation()
         userRequestedDisconnect = false
         automaticReconnectEnabled = true
@@ -611,6 +772,29 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         client.connect(to: device.endpoint, boardID: boardID)
+    }
+
+    func connectToRememberedDevice() {
+        guard
+            isNetworkingAuthorized,
+            canConnectRememberedDevice,
+            let record = lastConnectedDevice
+        else {
+            return
+        }
+
+        cancelAutomaticReconnect(resetDiagnostics: true)
+        cancelForegroundValidation()
+        userRequestedDisconnect = false
+        automaticReconnectEnabled = true
+        foregroundReconnectRequired = false
+        rememberedDeviceConnectionFailureAlert = nil
+
+        startManualRememberedConnection(to: record)
+    }
+
+    func dismissRememberedDeviceConnectionFailureAlert() {
+        rememberedDeviceConnectionFailureAlert = nil
     }
 
     func canSelectScannedDevice(_ device: DiscoveredESP32) -> Bool {
@@ -643,11 +827,13 @@ final class ESP32ControllerViewModel: ObservableObject {
         foregroundReconnectRequired = false
         cancelForegroundValidation()
         cancelAutomaticReconnect(resetDiagnostics: true)
+        cancelManualRememberedConnectionOperation()
         clearTimeSyncStateForConnectionChange()
         clearDisplayModeStateForConnectionChange()
         clearDefaultLogoRestoreStateForConnectionChange()
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
+        clearAlarmOperationsForConnectionChange(markInterrupted: true)
         activeConnectionGeneration = nil
         connectionAttempt = .explicitDisconnect
         isExpectingInitialDisconnect = false
@@ -732,7 +918,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         guard state == .connected else {
-            logoUploadState = .failed("Connect to an ESP32 before uploading a logo.")
+            logoUploadState = .failed("Connect to a CLOCK before uploading a logo.")
             return
         }
 
@@ -833,7 +1019,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         guard state == .connected else {
-            failDefaultLogoRestoreBeforeSend("Connect to an ESP32 before sending clock commands.")
+            failDefaultLogoRestoreBeforeSend("Connect to a CLOCK before sending clock commands.")
             return
         }
 
@@ -983,7 +1169,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         guard state == .connected else {
-            let message = "Connect to an ESP32 before sending clock commands."
+            let message = "Connect to a CLOCK before sending clock commands."
             isTimeSyncSuccessAlertPresented = false
             timeSyncState = .failed(message)
             commandStatusMessage = message
@@ -1074,7 +1260,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         guard state == .connected else {
-            let message = "Connect to an ESP32 before sending clock commands."
+            let message = "Connect to a CLOCK before sending clock commands."
             isDisplayModeSuccessAlertPresented = false
             confirmedDisplayMode = nil
             displayModeChangeState = .failed(message)
@@ -1146,6 +1332,271 @@ final class ESP32ControllerViewModel: ObservableObject {
         )
     }
 
+    func readAllAlarms() {
+        beginAlarmRead(ids: Array(AlarmRecord.validIDRange), total: AlarmRecord.maximumAlarmCount)
+    }
+
+    func readAlarm(id: Int) {
+        beginAlarmRead(ids: [id], total: 1)
+    }
+
+    func cancelAlarmRead() {
+        guard alarmReadOperationState.isReading else {
+            return
+        }
+
+        clearPendingAlarmRead(markInterrupted: true)
+    }
+
+    func selectAlarm(id: Int) {
+        guard AlarmRecord.validIDRange.contains(id) else {
+            return
+        }
+
+        selectedAlarmID = id
+        alarmSendState = .idle
+        alarmDeleteState = .idle
+        alarmEditorDraft = AlarmDraft(record: alarmRecords[id - 1])
+    }
+
+    func cancelAlarmEditing() {
+        guard !alarmSendState.isSending, !alarmDeleteState.isDeleting else {
+            return
+        }
+
+        selectedAlarmID = nil
+        alarmEditorDraft = nil
+        if case .succeeded = alarmSendState {
+            alarmSendState = .idle
+        }
+        if case .succeeded = alarmDeleteState {
+            alarmDeleteState = .idle
+        }
+    }
+
+    func alarmSendEligibility(for draft: AlarmDraft) -> AlarmEditorSendEligibility {
+        AlarmEditorSendEligibility.evaluate(
+            draft: draft,
+            connectionAvailable: canSendAlarm,
+            sendState: alarmSendState,
+            deleteState: alarmDeleteState,
+            hasPersistedChanges: alarmDraftHasPersistedChanges(draft)
+        )
+    }
+
+    func alarmDeleteEligibility(for draft: AlarmDraft) -> AlarmEditorDeleteEligibility {
+        AlarmEditorDeleteEligibility.evaluate(
+            draft: draft,
+            connectionAvailable: canDeleteAlarm,
+            originalAlarmIsConfigured: alarmDraftHasStoredAlarm(draft),
+            sendState: alarmSendState,
+            deleteState: alarmDeleteState
+        )
+    }
+
+    func alarmDraftHasPersistedChanges(_ draft: AlarmDraft) -> Bool {
+        guard let currentSignature = draft.currentPersistedSignature else {
+            return true
+        }
+
+        if let baselineSignature = draft.persistedBaselineSignature {
+            return currentSignature != baselineSignature
+        }
+
+        guard AlarmRecord.validIDRange.contains(draft.id) else {
+            return true
+        }
+
+        let record = alarmRecords[draft.id - 1]
+        guard
+            record.readState == .loaded,
+            record.isConfigured,
+            let baselineSignature = try? AlarmProtocolCodec.persistedSignature(for: record)
+        else {
+            return true
+        }
+
+        return currentSignature != baselineSignature
+    }
+
+    func alarmDraftHasStoredAlarm(_ draft: AlarmDraft) -> Bool {
+        if draft.persistedBaselineSignature != nil {
+            return true
+        }
+
+        guard AlarmRecord.validIDRange.contains(draft.id) else {
+            return false
+        }
+
+        let record = alarmRecords[draft.id - 1]
+        return record.readState == .loaded && record.isConfigured
+    }
+
+    func sendAlarm(_ draft: AlarmDraft) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
+        guard !alarmDeleteState.isDeleting else {
+            return
+        }
+
+        guard alarmDraftHasPersistedChanges(draft) else {
+            return
+        }
+
+        guard !alarmSendState.isSending else {
+            return
+        }
+
+        guard state == .connected else {
+            let message = "Connect to a CLOCK before sending alarm commands."
+            alarmSendState = .failed(id: draft.id, message: message)
+            commandStatusMessage = message
+            appendEvent(message)
+            return
+        }
+
+        cancelAlarmWriteTimeout()
+
+        let operationID = UUID()
+        let connectionGeneration = activeConnectionGeneration
+        let boardID = connectedProtocolBoardID
+
+        do {
+            let frame = try AlarmProtocolCodec.makeCARequest(boardID: boardID, draft: draft)
+            pendingAlarmWriteOperationID = operationID
+            pendingAlarmWriteConnectionGeneration = connectionGeneration
+            pendingAlarmWriteBoardID = boardID
+            pendingAlarmWriteDraft = draft
+            pendingAlarmWriteFrame = frame
+            alarmSendState = .sending(id: draft.id)
+            lastCAAlarmID = draft.id
+            lastCAResultText = "Pending"
+
+            client.send(Data(frame.bytes)) { [weak self] error in
+                DispatchQueue.main.async {
+                    guard
+                        let self,
+                        self.pendingAlarmWriteOperationID == operationID,
+                        self.pendingAlarmWriteConnectionGeneration == connectionGeneration,
+                        self.activeConnectionGeneration == connectionGeneration,
+                        self.pendingAlarmWriteDraft?.id == draft.id
+                    else {
+                        return
+                    }
+
+                    if let error {
+                        self.cancelAlarmWriteTimeout()
+                        self.clearPendingAlarmWrite()
+                        let message = "Unable to send Alarm \(draft.id)"
+                        self.alarmSendState = .failed(id: draft.id, message: message)
+                        self.lastCAResultText = "Error"
+                        self.commandStatusMessage = message
+                        self.appendEvent("\(message): \(error.localizedDescription)")
+                    } else {
+                        guard self.alarmSendState == .sending(id: draft.id) else {
+                            return
+                        }
+
+                        self.appendLog(direction: .outgoing, bytes: frame.bytes, message: "CA Alarm \(draft.id)")
+                        self.scheduleAlarmWriteTimeout(
+                            operationID: operationID,
+                            connectionGeneration: connectionGeneration,
+                            alarmID: draft.id
+                        )
+                    }
+                }
+            }
+        } catch {
+            clearPendingAlarmWrite()
+            let message = error.localizedDescription
+            alarmSendState = .failed(id: draft.id, message: message)
+            lastCAAlarmID = draft.id
+            lastCAResultText = "Error"
+            commandStatusMessage = message
+            appendEvent(message)
+        }
+    }
+
+    func deleteAlarm(_ draft: AlarmDraft) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
+        guard alarmDeleteEligibility(for: draft).canDelete else {
+            return
+        }
+
+        guard state == .connected else {
+            let message = "Connect to a CLOCK before deleting alarm configurations."
+            alarmDeleteState = .failed(id: draft.id, message: message)
+            commandStatusMessage = message
+            appendEvent(message)
+            return
+        }
+
+        cancelAlarmDeleteTimeout()
+
+        let operationID = UUID()
+        let connectionGeneration = activeConnectionGeneration
+        let boardID = connectedProtocolBoardID
+
+        do {
+            let bytes = try AlarmProtocolCodec.makeDARequest(boardID: boardID, alarmID: draft.id)
+            pendingAlarmDeleteOperationID = operationID
+            pendingAlarmDeleteConnectionGeneration = connectionGeneration
+            pendingAlarmDeleteBoardID = boardID
+            pendingAlarmDeleteID = draft.id
+            alarmDeleteState = .deleting(id: draft.id)
+            lastDAAlarmID = draft.id
+            lastDAResultText = "Pending"
+
+            client.send(Data(bytes)) { [weak self] error in
+                DispatchQueue.main.async {
+                    guard
+                        let self,
+                        self.pendingAlarmDeleteOperationID == operationID,
+                        self.pendingAlarmDeleteConnectionGeneration == connectionGeneration,
+                        self.activeConnectionGeneration == connectionGeneration,
+                        self.pendingAlarmDeleteID == draft.id
+                    else {
+                        return
+                    }
+
+                    if let error {
+                        self.cancelAlarmDeleteTimeout()
+                        self.clearPendingAlarmDelete()
+                        let message = "Unable to delete Alarm \(draft.id)"
+                        self.alarmDeleteState = .failed(id: draft.id, message: message)
+                        self.lastDAResultText = "Error"
+                        self.commandStatusMessage = message
+                        self.appendEvent("\(message): \(error.localizedDescription)")
+                    } else {
+                        guard self.alarmDeleteState == .deleting(id: draft.id) else {
+                            return
+                        }
+
+                        self.appendLog(direction: .outgoing, bytes: bytes, message: "DA Alarm \(draft.id)")
+                        self.scheduleAlarmDeleteTimeout(
+                            operationID: operationID,
+                            connectionGeneration: connectionGeneration,
+                            alarmID: draft.id
+                        )
+                    }
+                }
+            }
+        } catch {
+            clearPendingAlarmDelete()
+            let message = error.localizedDescription
+            alarmDeleteState = .failed(id: draft.id, message: message)
+            lastDAAlarmID = draft.id
+            lastDAResultText = "Error"
+            commandStatusMessage = message
+            appendEvent(message)
+        }
+    }
+
     func requestDeviceReset(resetID: UInt8) {
         guard isNetworkingAuthorized else {
             return
@@ -1190,7 +1641,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         guard state == .connected else {
-            commandStatusMessage = "Connect to an ESP32 before sending clock commands."
+            commandStatusMessage = "Connect to a CLOCK before sending clock commands."
             appendEvent(commandStatusMessage ?? "")
             onSendFinished?()
             return
@@ -1518,6 +1969,18 @@ final class ESP32ControllerViewModel: ObservableObject {
             return
         }
 
+        if consumeAlarmReadResponseIfExpected(bytes) {
+            return
+        }
+
+        if consumeAlarmWriteACKIfExpected(bytes) {
+            return
+        }
+
+        if consumeAlarmDeleteACKIfExpected(bytes) {
+            return
+        }
+
         appendLog(direction: .incoming, bytes: bytes)
     }
 
@@ -1613,7 +2076,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             commandStatusMessage = message
             appendLog(direction: .incoming, bytes: bytes, message: "DL Restore Default Logo Busy")
         case .storageFailure:
-            let message = "The ESP32 could not remove the SD-card logo."
+            let message = "The CLOCK could not remove the SD-card logo."
             defaultLogoRestoreState = .failed(message)
             commandStatusMessage = message
             appendLog(direction: .incoming, bytes: bytes, message: "DL Restore Default Logo Failed")
@@ -1774,6 +2237,494 @@ final class ESP32ControllerViewModel: ObservableObject {
         appendEvent(message)
     }
 
+    private func beginAlarmRead(ids: [Int], total: Int) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
+        guard !alarmReadOperationState.isReading else {
+            return
+        }
+
+        guard !alarmSendState.isSending, !alarmDeleteState.isDeleting else {
+            return
+        }
+
+        guard canUseClockControls else {
+            let message = "Connect to a CLOCK with a valid Board ID before reading alarms."
+            commandStatusMessage = message
+            appendEvent(message)
+            return
+        }
+
+        guard !ids.isEmpty, ids.allSatisfy({ AlarmRecord.validIDRange.contains($0) }) else {
+            let message = AlarmProtocolError.invalidAlarmID.localizedDescription
+            commandStatusMessage = message
+            appendEvent(message)
+            return
+        }
+
+        cancelAlarmReadTimeout()
+        let operationID = UUID()
+        pendingAlarmReadOperationID = operationID
+        pendingAlarmReadConnectionGeneration = activeConnectionGeneration
+        pendingAlarmReadBoardID = connectedProtocolBoardID
+        pendingAlarmReadID = nil
+        pendingAlarmReadQueue = ids
+        pendingAlarmReadTotal = total
+        alarmReadSuccesses = 0
+        alarmReadFailures = 0
+        lastAlarmReadID = nil
+        alarmReadOperationState = .reading(currentID: nil, completed: 0, total: total)
+        sendNextAlarmRead()
+    }
+
+    private func sendNextAlarmRead() {
+        guard
+            let operationID = pendingAlarmReadOperationID,
+            let connectionGeneration = pendingAlarmReadConnectionGeneration,
+            activeConnectionGeneration == connectionGeneration,
+            state == .connected,
+            pendingAlarmReadBoardID == connectedProtocolBoardID
+        else {
+            clearPendingAlarmRead(markInterrupted: true)
+            return
+        }
+
+        guard !pendingAlarmReadQueue.isEmpty else {
+            completeAlarmRead()
+            return
+        }
+
+        let alarmID = pendingAlarmReadQueue.removeFirst()
+        pendingAlarmReadID = alarmID
+        updateAlarmRecord(id: alarmID) { record in
+            record.readState = .loading
+        }
+
+        alarmReadOperationState = .reading(
+            currentID: alarmID,
+            completed: alarmReadSuccesses + alarmReadFailures,
+            total: pendingAlarmReadTotal
+        )
+
+        do {
+            let bytes = try AlarmProtocolCodec.makeLARequest(
+                boardID: pendingAlarmReadBoardID,
+                alarmID: alarmID
+            )
+
+            client.send(Data(bytes)) { [weak self] error in
+                DispatchQueue.main.async {
+                    guard
+                        let self,
+                        self.pendingAlarmReadOperationID == operationID,
+                        self.pendingAlarmReadConnectionGeneration == connectionGeneration,
+                        self.activeConnectionGeneration == connectionGeneration,
+                        self.pendingAlarmReadID == alarmID
+                    else {
+                        return
+                    }
+
+                    if let error {
+                        self.markPendingAlarmReadFailed(
+                            alarmID: alarmID,
+                            message: "Send failed: \(error.localizedDescription)"
+                        )
+                        self.sendNextAlarmRead()
+                    } else {
+                        self.appendLog(direction: .outgoing, bytes: bytes, message: "LA Alarm \(alarmID)")
+                        self.scheduleAlarmReadTimeout(
+                            operationID: operationID,
+                            connectionGeneration: connectionGeneration,
+                            alarmID: alarmID
+                        )
+                    }
+                }
+            }
+        } catch {
+            markPendingAlarmReadFailed(alarmID: alarmID, message: error.localizedDescription)
+            sendNextAlarmRead()
+        }
+    }
+
+    private func consumeAlarmReadResponseIfExpected(_ bytes: [UInt8]) -> Bool {
+        guard
+            alarmReadOperationState.isReading,
+            pendingAlarmReadOperationID != nil,
+            pendingAlarmReadConnectionGeneration == activeConnectionGeneration,
+            let boardID = pendingAlarmReadBoardID,
+            let expectedAlarmID = pendingAlarmReadID,
+            let record = try? AlarmProtocolCodec.decodeLAResponse(bytes, expectedBoardID: boardID),
+            record.id == expectedAlarmID
+        else {
+            return false
+        }
+
+        cancelAlarmReadTimeout()
+        alarmReadSuccesses += 1
+        lastAlarmReadID = record.id
+        alarmRecords[record.id - 1] = record
+        pendingAlarmReadID = nil
+        alarmReadOperationState = .reading(
+            currentID: nil,
+            completed: alarmReadSuccesses + alarmReadFailures,
+            total: pendingAlarmReadTotal
+        )
+        appendLog(direction: .incoming, bytes: bytes, message: "LA Alarm \(record.id)")
+        sendNextAlarmRead()
+        return true
+    }
+
+    private func scheduleAlarmReadTimeout(
+        operationID: UUID,
+        connectionGeneration: UUID?,
+        alarmID: Int
+    ) {
+        cancelAlarmReadTimeout()
+        alarmReadTimeoutTask = timeSyncScheduler(Self.alarmTransactionTimeout) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard
+                    let self,
+                    self.pendingAlarmReadOperationID == operationID,
+                    self.pendingAlarmReadConnectionGeneration == connectionGeneration,
+                    self.activeConnectionGeneration == connectionGeneration,
+                    self.pendingAlarmReadID == alarmID,
+                    self.alarmReadOperationState.isReading
+                else {
+                    return
+                }
+
+                self.alarmReadTimeoutTask = nil
+                self.markPendingAlarmReadFailed(alarmID: alarmID, message: "Read timed out")
+                self.sendNextAlarmRead()
+            }
+        }
+    }
+
+    private func markPendingAlarmReadFailed(alarmID: Int, message: String) {
+        cancelAlarmReadTimeout()
+        pendingAlarmReadID = nil
+        alarmReadFailures += 1
+        lastAlarmReadID = alarmID
+        updateAlarmRecord(id: alarmID) { record in
+            record.readState = .failed(message)
+        }
+        alarmReadOperationState = .reading(
+            currentID: nil,
+            completed: alarmReadSuccesses + alarmReadFailures,
+            total: pendingAlarmReadTotal
+        )
+    }
+
+    private func completeAlarmRead() {
+        let successful = alarmReadSuccesses
+        let failed = alarmReadFailures
+        let total = pendingAlarmReadTotal
+        alarmReadOperationState = .completed(successful: successful, failed: failed)
+        pendingAlarmReadOperationID = nil
+        pendingAlarmReadConnectionGeneration = nil
+        pendingAlarmReadBoardID = nil
+        pendingAlarmReadID = nil
+        pendingAlarmReadQueue.removeAll()
+        pendingAlarmReadTotal = 0
+        cancelAlarmReadTimeout()
+
+        let summary: String
+        if failed == 0 {
+            summary = "Read \(successful) of \(total) alarms."
+        } else {
+            summary = "Read \(successful) of \(total) alarms. \(failed) alarms could not be read."
+        }
+        commandStatusMessage = summary
+        appendEvent(summary)
+    }
+
+    private func cancelAlarmReadTimeout() {
+        alarmReadTimeoutTask?.cancel()
+        alarmReadTimeoutTask = nil
+    }
+
+    private func clearPendingAlarmRead(markInterrupted: Bool) {
+        let wasReading = alarmReadOperationState.isReading
+        let interruptedAlarmID = pendingAlarmReadID
+        cancelAlarmReadTimeout()
+        pendingAlarmReadOperationID = nil
+        pendingAlarmReadConnectionGeneration = nil
+        pendingAlarmReadBoardID = nil
+        pendingAlarmReadID = nil
+        pendingAlarmReadQueue.removeAll()
+        pendingAlarmReadTotal = 0
+
+        guard markInterrupted, wasReading else {
+            if !markInterrupted {
+                alarmReadOperationState = .idle
+            }
+            return
+        }
+
+        if let interruptedAlarmID {
+            updateAlarmRecord(id: interruptedAlarmID) { record in
+                record.readState = .failed("Read interrupted")
+            }
+        }
+
+        alarmReadOperationState = .interrupted(
+            successful: alarmReadSuccesses,
+            failed: alarmReadFailures
+        )
+        commandStatusMessage = "Alarm read interrupted."
+        appendEvent("Alarm read interrupted.")
+    }
+
+    private func consumeAlarmWriteACKIfExpected(_ bytes: [UInt8]) -> Bool {
+        guard
+            pendingAlarmWriteOperationID != nil,
+            pendingAlarmWriteConnectionGeneration == activeConnectionGeneration,
+            let boardID = pendingAlarmWriteBoardID,
+            let draft = pendingAlarmWriteDraft
+        else {
+            return false
+        }
+
+        do {
+            let alarmID = try AlarmProtocolCodec.decodeCAACK(bytes, expectedBoardID: boardID)
+            guard alarmID == draft.id else {
+                return false
+            }
+
+            guard let frame = pendingAlarmWriteFrame else {
+                return false
+            }
+
+            cancelAlarmWriteTimeout()
+            alarmRecords[alarmID - 1] = draft.acknowledgedRecord(
+                rawFrequency: frame.frequency,
+                rawDurationEffect: frame.durationEffect
+            )
+            clearPendingAlarmWrite()
+            alarmSendState = .succeeded(id: alarmID)
+            lastCAAlarmID = alarmID
+            lastCAResultText = "ACK"
+            commandStatusMessage = "Alarm \(alarmID) saved."
+            selectedAlarmID = nil
+            alarmEditorDraft = nil
+            appendLog(direction: .incoming, bytes: bytes, message: "CA Alarm \(alarmID) ACK")
+            return true
+        } catch {
+            guard isMalformedAlarmWriteACKCandidate(bytes, boardID: boardID) else {
+                return false
+            }
+
+            failPendingAlarmWrite(id: draft.id, message: AlarmProtocolError.malformedCAACK.localizedDescription, resultText: "Error")
+            appendLog(direction: .incoming, bytes: bytes, message: "Malformed CA Alarm \(draft.id) ACK")
+            return true
+        }
+    }
+
+    private func scheduleAlarmWriteTimeout(
+        operationID: UUID,
+        connectionGeneration: UUID?,
+        alarmID: Int
+    ) {
+        cancelAlarmWriteTimeout()
+        alarmWriteTimeoutTask = timeSyncScheduler(Self.alarmTransactionTimeout) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard
+                    let self,
+                    self.pendingAlarmWriteOperationID == operationID,
+                    self.pendingAlarmWriteConnectionGeneration == connectionGeneration,
+                    self.activeConnectionGeneration == connectionGeneration,
+                    self.pendingAlarmWriteDraft?.id == alarmID,
+                    self.alarmSendState == .sending(id: alarmID)
+                else {
+                    return
+                }
+
+                self.alarmWriteTimeoutTask = nil
+                self.failPendingAlarmWrite(
+                    id: alarmID,
+                    message: "Alarm \(alarmID) save not confirmed.",
+                    resultText: "Timeout"
+                )
+            }
+        }
+    }
+
+    private func failPendingAlarmWrite(id: Int, message: String, resultText: String) {
+        cancelAlarmWriteTimeout()
+        clearPendingAlarmWrite()
+        alarmSendState = .failed(id: id, message: message)
+        lastCAAlarmID = id
+        lastCAResultText = resultText
+        commandStatusMessage = message
+        appendEvent(message)
+    }
+
+    private func cancelAlarmWriteTimeout() {
+        alarmWriteTimeoutTask?.cancel()
+        alarmWriteTimeoutTask = nil
+    }
+
+    private func clearPendingAlarmWrite() {
+        pendingAlarmWriteOperationID = nil
+        pendingAlarmWriteConnectionGeneration = nil
+        pendingAlarmWriteBoardID = nil
+        pendingAlarmWriteDraft = nil
+        pendingAlarmWriteFrame = nil
+    }
+
+    private func consumeAlarmDeleteACKIfExpected(_ bytes: [UInt8]) -> Bool {
+        guard
+            pendingAlarmDeleteOperationID != nil,
+            pendingAlarmDeleteConnectionGeneration == activeConnectionGeneration,
+            let boardID = pendingAlarmDeleteBoardID,
+            let pendingAlarmDeleteID
+        else {
+            return false
+        }
+
+        do {
+            let alarmID = try AlarmProtocolCodec.decodeDAACK(bytes, expectedBoardID: boardID)
+            guard alarmID == pendingAlarmDeleteID else {
+                return false
+            }
+
+            cancelAlarmDeleteTimeout()
+            alarmRecords[alarmID - 1] = AlarmRecord.emptyLoadedRecord(id: alarmID)
+            clearPendingAlarmDelete()
+            alarmDeleteState = .succeeded(id: alarmID)
+            lastDAAlarmID = alarmID
+            lastDAResultText = "ACK"
+            commandStatusMessage = "Alarm \(alarmID) deleted."
+            selectedAlarmID = nil
+            alarmEditorDraft = nil
+            appendLog(direction: .incoming, bytes: bytes, message: "DA Alarm \(alarmID) ACK")
+            return true
+        } catch {
+            guard isMalformedAlarmDeleteACKCandidate(bytes, boardID: boardID) else {
+                return false
+            }
+
+            failPendingAlarmDelete(
+                id: pendingAlarmDeleteID,
+                message: AlarmProtocolError.malformedDAACK.localizedDescription,
+                resultText: "Error"
+            )
+            appendLog(direction: .incoming, bytes: bytes, message: "Malformed DA Alarm \(pendingAlarmDeleteID) ACK")
+            return true
+        }
+    }
+
+    private func scheduleAlarmDeleteTimeout(
+        operationID: UUID,
+        connectionGeneration: UUID?,
+        alarmID: Int
+    ) {
+        cancelAlarmDeleteTimeout()
+        alarmDeleteTimeoutTask = timeSyncScheduler(Self.alarmTransactionTimeout) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard
+                    let self,
+                    self.pendingAlarmDeleteOperationID == operationID,
+                    self.pendingAlarmDeleteConnectionGeneration == connectionGeneration,
+                    self.activeConnectionGeneration == connectionGeneration,
+                    self.pendingAlarmDeleteID == alarmID,
+                    self.alarmDeleteState == .deleting(id: alarmID)
+                else {
+                    return
+                }
+
+                self.alarmDeleteTimeoutTask = nil
+                self.failPendingAlarmDelete(
+                    id: alarmID,
+                    message: "Alarm \(alarmID) delete not confirmed.",
+                    resultText: "Timeout"
+                )
+            }
+        }
+    }
+
+    private func failPendingAlarmDelete(id: Int, message: String, resultText: String) {
+        cancelAlarmDeleteTimeout()
+        clearPendingAlarmDelete()
+        alarmDeleteState = .failed(id: id, message: message)
+        lastDAAlarmID = id
+        lastDAResultText = resultText
+        commandStatusMessage = message
+        appendEvent(message)
+    }
+
+    private func cancelAlarmDeleteTimeout() {
+        alarmDeleteTimeoutTask?.cancel()
+        alarmDeleteTimeoutTask = nil
+    }
+
+    private func clearPendingAlarmDelete() {
+        pendingAlarmDeleteOperationID = nil
+        pendingAlarmDeleteConnectionGeneration = nil
+        pendingAlarmDeleteBoardID = nil
+        pendingAlarmDeleteID = nil
+    }
+
+    private func clearAlarmOperationsForConnectionChange(markInterrupted: Bool) {
+        clearPendingAlarmRead(markInterrupted: markInterrupted)
+
+        if case let .sending(id) = alarmSendState {
+            cancelAlarmWriteTimeout()
+            clearPendingAlarmWrite()
+            let message = "Alarm \(id) save interrupted."
+            alarmSendState = .failed(id: id, message: message)
+            lastCAAlarmID = id
+            lastCAResultText = "Error"
+            commandStatusMessage = message
+        } else {
+            cancelAlarmWriteTimeout()
+            clearPendingAlarmWrite()
+        }
+
+        if case let .deleting(id) = alarmDeleteState {
+            cancelAlarmDeleteTimeout()
+            clearPendingAlarmDelete()
+            let message = "Alarm \(id) delete interrupted."
+            alarmDeleteState = .failed(id: id, message: message)
+            lastDAAlarmID = id
+            lastDAResultText = "Error"
+            commandStatusMessage = message
+        } else {
+            cancelAlarmDeleteTimeout()
+            clearPendingAlarmDelete()
+        }
+    }
+
+    private func updateAlarmRecord(id: Int, update: (inout AlarmRecord) -> Void) {
+        guard AlarmRecord.validIDRange.contains(id) else {
+            return
+        }
+
+        update(&alarmRecords[id - 1])
+    }
+
+    private func isMalformedAlarmWriteACKCandidate(_ bytes: [UInt8], boardID: UInt8) -> Bool {
+        bytes.count >= 6 &&
+            bytes[0] == 0x2F &&
+            bytes[1] == 0x74 &&
+            bytes[2] == 0x61 &&
+            bytes[3] == boardID &&
+            bytes[4] == 0x63 &&
+            bytes[5] == 0x61
+    }
+
+    private func isMalformedAlarmDeleteACKCandidate(_ bytes: [UInt8], boardID: UInt8) -> Bool {
+        bytes.count >= 6 &&
+            bytes[0] == 0x2F &&
+            bytes[1] == 0x74 &&
+            bytes[2] == 0x61 &&
+            bytes[3] == boardID &&
+            bytes[4] == 0x64 &&
+            bytes[5] == 0x61
+    }
+
     private func clearTimeSyncStateForConnectionChange() {
         cancelTimeSyncTasks()
         pendingTimeSyncOperationID = nil
@@ -1814,16 +2765,21 @@ final class ESP32ControllerViewModel: ObservableObject {
         foregroundReconnectRequired = false
         automaticReconnectEnabled = false
         userRequestedDisconnect = true
+        didEvaluateStartupReconnectForAuthorization = false
+        suppressAutomaticReconnectUntilInactive = false
         isScannerPresented = false
         scannerConnectionErrorText = nil
+        rememberedDeviceConnectionFailureAlert = nil
         pendingSelectedEndpointDescription = nil
         cancelForegroundValidation()
         cancelAutomaticReconnect(resetDiagnostics: true)
+        cancelManualRememberedConnectionOperation()
         clearTimeSyncStateForConnectionChange()
         clearDisplayModeStateForConnectionChange()
         clearDefaultLogoRestoreStateForConnectionChange()
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
+        clearAlarmOperationsForConnectionChange(markInterrupted: true)
         activeConnectionGeneration = nil
         connectionAttempt = .explicitDisconnect
         isExpectingInitialDisconnect = false
@@ -1849,6 +2805,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         clearDefaultLogoRestoreStateForConnectionChange()
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
+        clearAlarmOperationsForConnectionChange(markInterrupted: true)
         activeConnectionGeneration = UUID()
         connectionAttempt = .starting(target)
         isExpectingInitialDisconnect = true
@@ -1869,10 +2826,14 @@ final class ESP32ControllerViewModel: ObservableObject {
             pendingAutomaticReconnectRecord = nil
         case let .automaticReconnect(record):
             pendingConnectionEndpointDescription = record.endpointDescription
+        case let .rememberedDevice(record):
+            pendingConnectionEndpointDescription = record.endpointDescription
         }
     }
 
-    private func handleConnectionStateChange(_ newState: TCPConnectionState) {
+    private func handleConnectionStateChange(_ newState: TCPConnectionState) -> TCPConnectionState {
+        var presentationState = newState
+
         switch newState {
         case .connecting:
             if case let .starting(target) = connectionAttempt {
@@ -1886,12 +2847,15 @@ final class ESP32ControllerViewModel: ObservableObject {
                 break
             }
         case .failed:
+            let failedTarget = connectionAttempt.pendingTarget
+            let automaticReconnectRecord = failedTarget?.automaticReconnectRecord ?? activeAutomaticReconnectRecord
             cancelForegroundValidation()
             clearTimeSyncStateForConnectionChange()
             clearDisplayModeStateForConnectionChange()
             clearDefaultLogoRestoreStateForConnectionChange()
             clearLogoUploadStateForConnectionChange()
             clearClockConfigurationCacheForConnectionChange()
+            clearAlarmOperationsForConnectionChange(markInterrupted: true)
             activeConnectionGeneration = nil
             isExpectingInitialDisconnect = false
             connectionAttempt = .idle
@@ -1899,13 +2863,27 @@ final class ESP32ControllerViewModel: ObservableObject {
             pendingConnectionDevice = nil
             pendingAutomaticReconnectRecord = nil
             pendingSelectedEndpointDescription = nil
-            scannerConnectionErrorText = newState.detail ?? newState.title
+            scannerConnectionErrorText = failedTarget?.rememberedDeviceRecord == nil ? newState.detail ?? newState.title : nil
             connectedEndpointDescription = nil
             connectedDiscoveredDevice = nil
             connectedProtocolBoardID = nil
             pendingProtocolBoardID = nil
             discoveryService.updateConnectedEndpointDescription(nil)
-            finishAutomaticReconnectIfLastAttemptFailed()
+            if let record = failedTarget?.rememberedDeviceRecord {
+                if retryManualRememberedConnectionAfterFailure(for: record) {
+                    presentationState = .connecting
+                } else {
+                    finishManualRememberedConnectionWithFailure(for: record, cancelActiveConnection: false)
+                    presentationState = .disconnected
+                }
+            }
+            if let automaticReconnectRecord {
+                if finishAutomaticReconnectIfLastAttemptFailed(record: automaticReconnectRecord) {
+                    presentationState = .disconnected
+                } else {
+                    presentationState = .connecting
+                }
+            }
         case .disconnected:
             if isBackgroundDisconnectInProgress {
                 isBackgroundDisconnectInProgress = false
@@ -1913,15 +2891,18 @@ final class ESP32ControllerViewModel: ObservableObject {
 
             if isExpectingInitialDisconnect {
                 isExpectingInitialDisconnect = false
-                return
+                return presentationState
             }
 
+            let disconnectedTarget = connectionAttempt.pendingTarget
+            let automaticReconnectRecord = disconnectedTarget?.automaticReconnectRecord ?? activeAutomaticReconnectRecord
             cancelForegroundValidation()
             clearTimeSyncStateForConnectionChange()
             clearDisplayModeStateForConnectionChange()
             clearDefaultLogoRestoreStateForConnectionChange()
             clearLogoUploadStateForConnectionChange()
             clearClockConfigurationCacheForConnectionChange()
+            clearAlarmOperationsForConnectionChange(markInterrupted: true)
             activeConnectionGeneration = nil
             connectionAttempt = .idle
             pendingConnectionEndpointDescription = nil
@@ -1933,8 +2914,24 @@ final class ESP32ControllerViewModel: ObservableObject {
             connectedProtocolBoardID = nil
             pendingProtocolBoardID = nil
             discoveryService.updateConnectedEndpointDescription(nil)
-            finishAutomaticReconnectIfLastAttemptFailed()
+            if let record = disconnectedTarget?.rememberedDeviceRecord {
+                if retryManualRememberedConnectionAfterFailure(for: record) {
+                    presentationState = .connecting
+                } else {
+                    finishManualRememberedConnectionWithFailure(for: record, cancelActiveConnection: false)
+                    presentationState = .disconnected
+                }
+            }
+            if let automaticReconnectRecord {
+                if finishAutomaticReconnectIfLastAttemptFailed(record: automaticReconnectRecord) {
+                    presentationState = .disconnected
+                } else {
+                    presentationState = .connecting
+                }
+            }
         }
+
+        return presentationState
     }
 
     private func completeConnection(to target: ConnectionTarget) {
@@ -1957,10 +2954,17 @@ final class ESP32ControllerViewModel: ObservableObject {
             connectedDiscoveredDevice = pendingConnectionDevice
             resumeActionDiagnosticsText = "Connected"
             foregroundValidationDiagnosticsText = "Idle"
+            if automaticReconnectIntent == .startupAutomatic {
+                appendEvent("Startup reconnect succeeded")
+            }
+        case .rememberedDevice:
+            connectedEndpointDescription = pendingConnectionEndpointDescription
+            connectedDiscoveredDevice = pendingConnectionDevice
         }
 
         connectedProtocolBoardID = pendingProtocolBoardID
         persistLastConnectedDeviceIfPossible(for: target, boardID: pendingProtocolBoardID)
+        rememberedDeviceConnectionFailureAlert = nil
         pendingSelectedEndpointDescription = nil
         pendingConnectionDevice = nil
         pendingAutomaticReconnectRecord = nil
@@ -1970,11 +2974,185 @@ final class ESP32ControllerViewModel: ObservableObject {
         scannerConnectionErrorText = nil
         discoveryService.updateConnectedEndpointDescription(connectedEndpointDescription)
         connectionAttempt = .connected(target)
+        suppressAutomaticReconnectUntilInactive = false
+        if case .rememberedDevice = target {
+            appendEvent("Manual connect succeeded")
+            cancelManualRememberedConnectionOperation()
+        }
         cancelAutomaticReconnect(resetDiagnostics: false)
     }
 
     private var shouldShowAutomaticReconnectStatus: Bool {
         automaticReconnectGeneration != nil && state != .connected
+    }
+
+    private func nextAutomaticReconnectIntentForActiveScene() -> AutomaticReconnectIntent {
+        guard didEvaluateStartupReconnectForAuthorization else {
+            didEvaluateStartupReconnectForAuthorization = true
+            return .startupAutomatic
+        }
+
+        return .backgroundAutomatic
+    }
+
+    private var isConnectionAttemptPending: Bool {
+        connectionAttempt.pendingTarget != nil
+    }
+
+    private var isRememberedDeviceConnectionPending: Bool {
+        connectionAttempt.pendingTarget?.rememberedDeviceRecord != nil
+    }
+
+    private var activeAutomaticReconnectRecord: LastConnectedDevice? {
+        guard automaticReconnectGeneration != nil else {
+            return nil
+        }
+
+        return pendingAutomaticReconnectRecord ?? lastConnectedDevice
+    }
+
+    private func startManualRememberedConnection(to record: LastConnectedDevice) {
+        cancelManualRememberedConnectionOperation()
+
+        let operationID = UUID()
+        manualRememberedConnectionOperation = ManualRememberedConnectionOperation(
+            id: operationID,
+            record: record
+        )
+        appendEvent("Manual connect started: \(record.presentedDisplayName)")
+        manualRememberedConnectionOperation?.deadlineTask = manualConnectScheduler(Self.manualRememberedConnectionDeadline) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleManualRememberedConnectionDeadline(operationID: operationID)
+            }
+        }
+
+        guard startNextManualRememberedConnectionAttempt(operationID: operationID, isRetry: false) else {
+            finishManualRememberedConnectionWithFailure(for: record, cancelActiveConnection: false)
+            return
+        }
+    }
+
+    private func retryManualRememberedConnectionAfterFailure(for record: LastConnectedDevice) -> Bool {
+        guard
+            let operation = manualRememberedConnectionOperation,
+            operation.record == record
+        else {
+            return false
+        }
+
+        appendEvent("Manual connect attempt \(operation.startedAttemptCount) failed")
+        return startNextManualRememberedConnectionAttempt(operationID: operation.id, isRetry: true)
+    }
+
+    private func startNextManualRememberedConnectionAttempt(operationID: UUID, isRetry: Bool) -> Bool {
+        guard
+            var operation = manualRememberedConnectionOperation,
+            operation.id == operationID
+        else {
+            return false
+        }
+
+        guard let attempt = nextManualRememberedConnectionAttempt(for: &operation) else {
+            manualRememberedConnectionOperation = operation
+            return false
+        }
+
+        manualRememberedConnectionOperation = operation
+
+        if isRetry {
+            appendEvent("Manual connect retry using refreshed endpoint")
+        }
+
+        beginConnectionAttempt(.rememberedDevice(operation.record))
+        pendingConnectionDevice = attempt.candidate.device
+        pendingProtocolBoardID = operation.record.boardID
+        pendingConnectionEndpointDescription = attempt.candidate.endpointDescription
+        endpointSourceDiagnosticsText = attempt.candidate.source.diagnosticsText
+        client.connect(to: attempt.candidate.endpoint, boardID: operation.record.boardID)
+        return true
+    }
+
+    private func nextManualRememberedConnectionAttempt(
+        for operation: inout ManualRememberedConnectionOperation
+    ) -> ManualRememberedConnectionAttempt? {
+        while
+            operation.startedAttemptCount < Self.manualRememberedConnectionMaxAttempts,
+            operation.nextCandidateIndex < Self.automaticReconnectDelays.count
+        {
+            let candidateIndex = operation.nextCandidateIndex
+            operation.nextCandidateIndex += 1
+
+            guard let candidate = automaticReconnectCandidate(
+                for: operation.record,
+                attemptIndex: candidateIndex
+            ) else {
+                continue
+            }
+
+            let candidateKey = "\(candidate.source.diagnosticsText)|\(candidate.endpointDescription)"
+            guard !operation.attemptedCandidateKeys.contains(candidateKey) else {
+                continue
+            }
+
+            operation.attemptedCandidateKeys.insert(candidateKey)
+            operation.startedAttemptCount += 1
+            return ManualRememberedConnectionAttempt(candidate: candidate)
+        }
+
+        return nil
+    }
+
+    private func handleManualRememberedConnectionDeadline(operationID: UUID) {
+        guard
+            let operation = manualRememberedConnectionOperation,
+            operation.id == operationID
+        else {
+            return
+        }
+
+        appendEvent("Manual connect deadline expired")
+        finishManualRememberedConnectionWithFailure(for: operation.record, cancelActiveConnection: true)
+    }
+
+    private func finishManualRememberedConnectionWithFailure(
+        for record: LastConnectedDevice,
+        cancelActiveConnection: Bool
+    ) {
+        cancelManualRememberedConnectionOperation()
+        cancelForegroundValidation()
+        clearTimeSyncStateForConnectionChange()
+        clearDisplayModeStateForConnectionChange()
+        clearDefaultLogoRestoreStateForConnectionChange()
+        clearLogoUploadStateForConnectionChange()
+        clearClockConfigurationCacheForConnectionChange()
+        clearAlarmOperationsForConnectionChange(markInterrupted: true)
+        activeConnectionGeneration = nil
+        connectionAttempt = .idle
+        isExpectingInitialDisconnect = false
+        pendingConnectionEndpointDescription = nil
+        pendingConnectionDevice = nil
+        pendingAutomaticReconnectRecord = nil
+        pendingSelectedEndpointDescription = nil
+        pendingProtocolBoardID = nil
+        connectedEndpointDescription = nil
+        connectedDiscoveredDevice = nil
+        connectedProtocolBoardID = nil
+        scannerConnectionErrorText = nil
+        discoveryService.updateConnectedEndpointDescription(nil)
+        rememberedDeviceConnectionFailureAlert = DeviceConnectionFailureAlert(
+            deviceName: record.presentedDisplayName
+        )
+        state = .disconnected
+        appendEvent("Manual connect failed: Device Not Found")
+
+        if cancelActiveConnection {
+            client.disconnect()
+        }
+    }
+
+    private func cancelManualRememberedConnectionOperation() {
+        manualRememberedConnectionOperation?.deadlineTask?.cancel()
+        manualRememberedConnectionOperation = nil
     }
 
     private func validateForegroundConnectionIfNeeded() {
@@ -2024,19 +3202,27 @@ final class ESP32ControllerViewModel: ObservableObject {
                     self.foregroundValidationDiagnosticsText = "Failed"
                     self.state = .disconnected
                     self.client.disconnect()
-                    self.startAutomaticReconnectIfPossible(replacingCurrentConnection: true)
+                    self.startAutomaticReconnectIfPossible(
+                        replacingCurrentConnection: true,
+                        intent: .backgroundAutomatic
+                    )
                 }
             }
         }
     }
 
-    private func startAutomaticReconnectIfPossible(replacingCurrentConnection: Bool = false) {
+    private func startAutomaticReconnectIfPossible(
+        replacingCurrentConnection: Bool = false,
+        intent: AutomaticReconnectIntent
+    ) {
         guard
             isNetworkingAuthorized,
             isAppActive,
+            !suppressAutomaticReconnectUntilInactive,
             automaticReconnectEnabled,
             !userRequestedDisconnect,
             automaticReconnectGeneration == nil,
+            !isConnectionAttemptPending,
             let record = lastConnectedDevice,
             record.boardID != ESP32TCPClient.reservedBoardID
         else {
@@ -2048,15 +3234,29 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         let generation = UUID()
+        let attemptLimit = min(intent.maximumAttemptCount, Self.automaticReconnectDelays.count)
+        guard attemptLimit > 0 else {
+            return
+        }
+
+        let attemptIndices = Array(Self.automaticReconnectDelays.indices.prefix(attemptLimit))
         automaticReconnectGeneration = generation
+        automaticReconnectIntent = intent
         foregroundReconnectRequired = false
         resumeActionDiagnosticsText = "Reconnecting"
         foregroundValidationDiagnosticsText = "Idle"
-        reconnectAttemptDiagnosticsText = "0 of \(Self.automaticReconnectDelays.count)"
+        reconnectAttemptDiagnosticsText = "0 of \(attemptLimit)"
         endpointSourceDiagnosticsText = "None"
         automaticReconnectLastStartedAttemptIndex = nil
+        automaticReconnectLastScheduledAttemptIndex = attemptIndices.last
+        automaticReconnectAttemptLimit = attemptLimit
 
-        for (index, delay) in Self.automaticReconnectDelays.enumerated() {
+        if intent == .startupAutomatic {
+            appendEvent("Startup reconnect started: \(record.presentedDisplayName)")
+        }
+
+        for index in attemptIndices {
+            let delay = Self.automaticReconnectDelays[index]
             if delay == 0 {
                 performAutomaticReconnectAttempt(index: index, generation: generation, record: record)
             } else {
@@ -2066,6 +3266,12 @@ final class ESP32ControllerViewModel: ObservableObject {
                     }
                 }
                 automaticReconnectTasks.append(task)
+            }
+        }
+
+        automaticReconnectDeadlineTask = reconnectScheduler(Self.automaticReconnectDeadline) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleAutomaticReconnectDeadline(generation: generation, record: record)
             }
         }
     }
@@ -2091,8 +3297,12 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         guard let candidate = automaticReconnectCandidate(for: record, attemptIndex: index) else {
-            if Self.automaticReconnectDelays.indices.last == index {
-                finishAutomaticReconnectAttempts(generation: generation)
+            if automaticReconnectLastScheduledAttemptIndex == index {
+                finishAutomaticReconnectAttempts(
+                    generation: generation,
+                    finalRecord: record,
+                    cancelActiveConnection: true
+                )
             }
             return
         }
@@ -2101,7 +3311,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         pendingConnectionDevice = candidate.device
         pendingProtocolBoardID = record.boardID
         pendingConnectionEndpointDescription = candidate.endpointDescription
-        reconnectAttemptDiagnosticsText = "\(index + 1) of \(Self.automaticReconnectDelays.count)"
+        reconnectAttemptDiagnosticsText = "\(index + 1) of \(automaticReconnectAttemptLimit)"
         endpointSourceDiagnosticsText = candidate.source.diagnosticsText
         automaticReconnectLastStartedAttemptIndex = index
 
@@ -2109,32 +3319,100 @@ final class ESP32ControllerViewModel: ObservableObject {
         client.connect(to: candidate.endpoint, boardID: record.boardID)
     }
 
-    private func finishAutomaticReconnectIfLastAttemptFailed() {
+    @discardableResult
+    private func finishAutomaticReconnectIfLastAttemptFailed(record: LastConnectedDevice?) -> Bool {
         guard
             let generation = automaticReconnectGeneration,
-            automaticReconnectLastStartedAttemptIndex == Self.automaticReconnectDelays.indices.last
+            let lastScheduledAttemptIndex = automaticReconnectLastScheduledAttemptIndex,
+            automaticReconnectLastStartedAttemptIndex == lastScheduledAttemptIndex
         else {
-            return
+            return false
         }
 
-        finishAutomaticReconnectAttempts(generation: generation)
+        finishAutomaticReconnectAttempts(
+            generation: generation,
+            finalRecord: record,
+            cancelActiveConnection: false
+        )
+        return true
     }
 
-    private func finishAutomaticReconnectAttempts(generation: UUID) {
+    private func handleAutomaticReconnectDeadline(generation: UUID, record: LastConnectedDevice) {
         guard automaticReconnectGeneration == generation else {
             return
         }
 
+        if automaticReconnectIntent == .startupAutomatic {
+            appendEvent("Startup reconnect deadline expired")
+        }
+
+        finishAutomaticReconnectAttempts(
+            generation: generation,
+            finalRecord: record,
+            cancelActiveConnection: true
+        )
+    }
+
+    private func finishAutomaticReconnectAttempts(
+        generation: UUID,
+        finalRecord: LastConnectedDevice?,
+        cancelActiveConnection: Bool
+    ) {
+        guard automaticReconnectGeneration == generation else {
+            return
+        }
+
+        let intent = automaticReconnectIntent
+        let record = finalRecord ?? pendingAutomaticReconnectRecord ?? lastConnectedDevice
+
         cancelAutomaticReconnect(resetDiagnostics: false)
+        cancelForegroundValidation()
+        clearTimeSyncStateForConnectionChange()
+        clearDisplayModeStateForConnectionChange()
+        clearDefaultLogoRestoreStateForConnectionChange()
+        clearLogoUploadStateForConnectionChange()
+        clearClockConfigurationCacheForConnectionChange()
+        clearAlarmOperationsForConnectionChange(markInterrupted: true)
+        activeConnectionGeneration = nil
+        connectionAttempt = .idle
+        isExpectingInitialDisconnect = false
+        pendingConnectionEndpointDescription = nil
+        pendingConnectionDevice = nil
+        pendingAutomaticReconnectRecord = nil
+        pendingSelectedEndpointDescription = nil
+        pendingProtocolBoardID = nil
+        connectedEndpointDescription = nil
+        connectedDiscoveredDevice = nil
+        connectedProtocolBoardID = nil
+        scannerConnectionErrorText = nil
+        discoveryService.updateConnectedEndpointDescription(nil)
         resumeActionDiagnosticsText = "Idle"
         endpointSourceDiagnosticsText = "None"
+        state = .disconnected
+
+        if intent == .startupAutomatic, let record {
+            suppressAutomaticReconnectUntilInactive = true
+            rememberedDeviceConnectionFailureAlert = DeviceConnectionFailureAlert(
+                deviceName: record.presentedDisplayName
+            )
+            appendEvent("Startup reconnect failed: Device Not Found")
+        }
+
+        if cancelActiveConnection {
+            client.disconnect()
+        }
     }
 
     private func cancelAutomaticReconnect(resetDiagnostics: Bool) {
         automaticReconnectTasks.forEach { $0.cancel() }
         automaticReconnectTasks.removeAll()
+        automaticReconnectDeadlineTask?.cancel()
+        automaticReconnectDeadlineTask = nil
         automaticReconnectGeneration = nil
+        automaticReconnectIntent = nil
         automaticReconnectLastStartedAttemptIndex = nil
+        automaticReconnectLastScheduledAttemptIndex = nil
+        automaticReconnectAttemptLimit = 0
         pendingAutomaticReconnectRecord = nil
 
         if resetDiagnostics {
@@ -2289,6 +3567,8 @@ final class ESP32ControllerViewModel: ObservableObject {
                 record = nil
             }
         case let .automaticReconnect(existingRecord):
+            record = existingRecord.withDefaultLogoFallback()
+        case let .rememberedDevice(existingRecord):
             record = existingRecord.withDefaultLogoFallback()
         }
 
@@ -2512,7 +3792,7 @@ enum DefaultLogoRestoreState: Equatable {
         case .sending:
             "Sending command"
         case .waitingForConfirmation:
-            "Waiting for ESP32 confirmation"
+            "Waiting for CLOCK confirmation"
         case .succeeded:
             "Succeeded"
         case let .failed(message):
@@ -2605,6 +3885,10 @@ struct LastConnectedDevice: Codable, Equatable {
         return displayName
     }
 
+    var presentedDisplayName: String {
+        displayName.removingESP32PresentationPrefix
+    }
+
     func withLogoUploadEndpoint(_ endpoint: DiscoveredLogoUploadEndpoint?) -> LastConnectedDevice {
         guard let endpoint, endpoint.boardID == boardID else {
             return withDefaultLogoFallback()
@@ -2675,6 +3959,33 @@ private struct AutomaticReconnectCandidate {
     let device: DiscoveredESP32?
 }
 
+private struct ManualRememberedConnectionOperation {
+    let id: UUID
+    let record: LastConnectedDevice
+    var nextCandidateIndex = 0
+    var startedAttemptCount = 0
+    var attemptedCandidateKeys: Set<String> = []
+    var deadlineTask: CancellableTask?
+}
+
+private struct ManualRememberedConnectionAttempt {
+    let candidate: AutomaticReconnectCandidate
+}
+
+private enum AutomaticReconnectIntent {
+    case startupAutomatic
+    case backgroundAutomatic
+
+    var maximumAttemptCount: Int {
+        switch self {
+        case .startupAutomatic:
+            ESP32ControllerViewModel.startupAutomaticReconnectMaxAttempts
+        case .backgroundAutomatic:
+            ESP32ControllerViewModel.automaticReconnectDelays.count
+        }
+    }
+}
+
 private enum LogoUploadEndpointSource {
     case discoveredBonjour
     case cachedBonjour
@@ -2701,10 +4012,63 @@ private struct LogoUploadTarget {
     let destinationDescription: String
 }
 
+struct DeviceConnectionFailureAlert: Equatable {
+    let deviceName: String
+
+    var title: String {
+        "Device Not Found"
+    }
+
+    var message: String {
+        "\(deviceName) was not found. Check that the device is powered on and connected to the network."
+    }
+}
+
+struct ClockDevicesSectionPresentation: Equatable {
+    let deviceLabel = "Device"
+    let deviceName: String?
+    let deviceNameStyle: ClockDevicesTextStyle
+    let stateLabel = "State"
+    let stateText: String
+    let stateStyle: ClockDevicesStateStyle
+    let action: ClockDevicesAction?
+}
+
+enum ClockDevicesTextStyle: Equatable {
+    case primary
+}
+
+enum ClockDevicesStateStyle: Equatable {
+    case connected
+    case disconnected
+    case connecting
+    case failed
+
+    init(connectionState: TCPConnectionState) {
+        switch connectionState {
+        case .connected:
+            self = .connected
+        case .disconnected:
+            self = .disconnected
+        case .connecting:
+            self = .connecting
+        case .failed:
+            self = .failed
+        }
+    }
+}
+
+enum ClockDevicesAction: Equatable {
+    case connect
+    case connecting
+    case disconnect
+}
+
 private enum ConnectionTarget: Equatable {
     case manual
     case discovered(String)
     case automaticReconnect(LastConnectedDevice)
+    case rememberedDevice(LastConnectedDevice)
 }
 
 private enum ConnectionAttempt: Equatable {
@@ -2713,6 +4077,35 @@ private enum ConnectionAttempt: Equatable {
     case connecting(ConnectionTarget)
     case connected(ConnectionTarget)
     case explicitDisconnect
+}
+
+private extension ConnectionAttempt {
+    var pendingTarget: ConnectionTarget? {
+        switch self {
+        case let .starting(target), let .connecting(target):
+            target
+        case .idle, .connected, .explicitDisconnect:
+            nil
+        }
+    }
+}
+
+private extension ConnectionTarget {
+    var rememberedDeviceRecord: LastConnectedDevice? {
+        if case let .rememberedDevice(record) = self {
+            return record
+        }
+
+        return nil
+    }
+
+    var automaticReconnectRecord: LastConnectedDevice? {
+        if case let .automaticReconnect(record) = self {
+            return record
+        }
+
+        return nil
+    }
 }
 
 private struct ClockConfiguration: Equatable {

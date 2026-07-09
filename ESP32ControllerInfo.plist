@@ -28,7 +28,7 @@
 		<string>_espclock-logo._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>This app connects to ESP32 controllers on your local network.</string>
+	<string>This app connects to CLOCK controllers on your local network.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

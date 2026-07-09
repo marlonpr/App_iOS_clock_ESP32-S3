@@ -128,7 +128,7 @@ struct LoginView: View {
                     .disabled(session.serverHealthState == .testing)
                 }
             }
-            .navigationTitle("ESP32 TCP")
+            .navigationTitle("CLOCK TCP")
             .onAppear {
                 formState.clearFocus()
                 focusedField = nil

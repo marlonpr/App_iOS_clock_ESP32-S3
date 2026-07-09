@@ -45,6 +45,400 @@ struct ESP32ControllerTests {
         #expect(ESP32DiscoveryService.serviceInstanceName(from: .hostPort(host: "192.168.4.1", port: 5000)) == nil)
     }
 
+    @Test func devicePresentationNormalizesOnlyTheESP32Prefix() {
+        let device = DiscoveredESP32(
+            id: "service-a",
+            serviceName: "ESP32 Clock 12",
+            endpoint: .service(
+                name: "ESP32 Clock 12",
+                type: ESP32DiscoveryService.serviceType,
+                domain: "local",
+                interface: nil
+            ),
+            boardID: "12",
+            model: "ESP32-S3",
+            protocolVersion: "1",
+            firmwareVersion: "1.0.0"
+        )
+
+        #expect(device.presentedServiceName == "Clock 12")
+        #expect(device.model == "ESP32-S3")
+        #expect("ESP32-S3".removingESP32PresentationPrefix == "ESP32-S3")
+        #expect("ESP32-S3-WROOM-1".removingESP32PresentationPrefix == "ESP32-S3-WROOM-1")
+    }
+
+    @Test func mainControlBottomActionsUseTargetSpecificPresentationOrder() {
+        let titles = MainControlBottomAction.visibleActions.map(\.title)
+
+#if LOGIN_ENABLED
+        #expect(titles == [
+            "Clock Factory Reset",
+            "Log Out",
+            "Advanced / Diagnostics"
+        ])
+#else
+        #expect(titles == [
+            "Clock Factory Reset",
+            "Advanced / Diagnostics"
+        ])
+        #expect(!titles.contains("Log Out"))
+#endif
+        #expect(!titles.contains("Device Default Configuration"))
+        #expect(titles.filter { $0 == "Clock Factory Reset" }.count == 1)
+    }
+
+    @MainActor
+    @Test func connectedDevicePresentedNameUsesNormalizedDisplayName() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForConnectionIndicatorTests(recorder: recorder)
+        let device = makeDevice(id: "service-a", serviceName: "ESP32 Clock 0", boardID: "board-0")
+
+        viewModel.connect(to: device)
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(viewModel.connectedDevicePresentedName == "Clock 0")
+        #expect(viewModel.connectedDiscoveredDevice?.presentedServiceName == "Clock 0")
+    }
+
+    @MainActor
+    @Test func connectedDevicePresentedNameFallsBackToSavedLastDevice() {
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(
+            LastConnectedDevice(
+                boardID: 0,
+                displayName: "ESP32 Clock 12",
+                serviceInstanceName: "ESP32 Clock 12",
+                serviceType: ESP32DiscoveryService.serviceType,
+                serviceDomain: "local",
+                hostname: "esp32-clock-12.local",
+                controlPort: ESP32TCPClient.defaultPort,
+                source: .bonjour,
+                manualHost: nil
+            ),
+            to: defaults
+        )
+
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: FakeTCPConnectionRecorder(),
+            userDefaults: defaults
+        )
+
+        #expect(viewModel.connectedDevicePresentedName == "Clock 12")
+    }
+
+    @MainActor
+    @Test func clockDevicesPresentationUsesDeviceLabelPrimaryNameConnectedStateAndDisconnectAction() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            userDefaults: makeIsolatedUserDefaults()
+        )
+        let device = makeDevice(id: "service-clock-0", serviceName: "ESP32 Clock 0", boardID: "0")
+
+        viewModel.connect(to: device)
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        let presentation = viewModel.clockDevicesSectionPresentation
+        #expect(presentation.deviceLabel == "Device")
+        #expect(presentation.deviceName == "Clock 0")
+        #expect(presentation.deviceNameStyle == .primary)
+        #expect(presentation.stateLabel == "State")
+        #expect(presentation.stateText == "Connected")
+        #expect(presentation.stateStyle == .connected)
+        #expect(presentation.action == .disconnect)
+    }
+
+    @MainActor
+    @Test func disconnectPreservesRememberedNameAndShowsConnectAction() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            userDefaults: makeIsolatedUserDefaults()
+        )
+        let device = makeDevice(id: "service-clock-0", serviceName: "ESP32 Clock 0", boardID: "0")
+
+        viewModel.connect(to: device)
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        viewModel.disconnect()
+        await drainMainQueue()
+
+        let presentation = viewModel.clockDevicesSectionPresentation
+        #expect(presentation.deviceName == "Clock 0")
+        #expect(presentation.stateText == "Disconnected")
+        #expect(presentation.stateStyle == .disconnected)
+        #expect(presentation.action == .connect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func rememberedConnectIsUnavailableWithoutRememberedDevice() {
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: FakeTCPConnectionRecorder(),
+            userDefaults: makeIsolatedUserDefaults()
+        )
+
+        #expect(viewModel.connectedDevicePresentedName == nil)
+        #expect(!viewModel.canConnectRememberedDevice)
+        #expect(viewModel.clockDevicesSectionPresentation.action == nil)
+    }
+
+    @MainActor
+    @Test func rememberedConnectPreventsDuplicateConcurrentAttempts() {
+        let recorder = FakeTCPConnectionRecorder()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(displayName: "ESP32 Clock 0", serviceInstanceName: "ESP32 Clock 0"), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(recorder: recorder, userDefaults: defaults)
+
+        viewModel.connectToRememberedDevice()
+        viewModel.connectToRememberedDevice()
+
+        #expect(recorder.connections.count == 1)
+        #expect(!viewModel.canConnectRememberedDevice)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connecting)
+    }
+
+    @MainActor
+    @Test func rememberedConnectSuccessUsesConnectedPresentationCancelsDeadlineAndNoFailureAlert() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let manualScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(displayName: "ESP32 Clock 0", serviceInstanceName: "ESP32 Clock 0"), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            manualConnectScheduler: manualScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+
+        #expect(manualScheduler.tasks.map(\.delay) == [ESP32ControllerViewModel.manualRememberedConnectionDeadline])
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        let presentation = viewModel.clockDevicesSectionPresentation
+        #expect(viewModel.state == .connected)
+        #expect(presentation.deviceName == "Clock 0")
+        #expect(presentation.stateStyle == .connected)
+        #expect(presentation.action == .disconnect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+        #expect(manualScheduler.tasks[0].isCancelled)
+
+        manualScheduler.tasks[0].fireIgnoringCancellationForTesting()
+        await drainMainQueue()
+
+        #expect(viewModel.state == .connected)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .disconnect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func rememberedConnectDeadlineExpiresWithDeviceNotFoundAndKeepsRememberedName() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let manualScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(displayName: "ESP32 Clock 0", serviceInstanceName: "ESP32 Clock 0"), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            manualConnectScheduler: manualScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connecting)
+        #expect(!viewModel.canConnectRememberedDevice)
+        #expect(manualScheduler.tasks.count == 1)
+
+        manualScheduler.tasks[0].fire()
+        await drainMainQueue()
+
+        let alert = try #require(viewModel.rememberedDeviceConnectionFailureAlert)
+        #expect(viewModel.state == .disconnected)
+        #expect(viewModel.clockDevicesSectionPresentation.deviceName == "Clock 0")
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connect)
+        #expect(viewModel.canConnectRememberedDevice)
+        #expect(viewModel.lastConnectedDevice?.presentedDisplayName == "Clock 0")
+        #expect(alert.title == "Device Not Found")
+        #expect(alert.message == "Clock 0 was not found. Check that the device is powered on and connected to the network.")
+        #expect(recorder.connections[0].cancelCallCount >= 1)
+
+        viewModel.dismissRememberedDeviceConnectionFailureAlert()
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+        #expect(viewModel.canConnectRememberedDevice)
+
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+
+        #expect(recorder.connections.count == 2)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connecting)
+    }
+
+    @MainActor
+    @Test func rememberedConnectRetriesOnceAndSecondAttemptCanSucceed() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(displayName: "ESP32 Clock 0", serviceInstanceName: "ESP32 Clock 0"), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(recorder: recorder, userDefaults: defaults)
+
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.failed(.posix(.ECONNREFUSED)))
+        await drainMainQueue()
+
+        #expect(recorder.connections.count == 2)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connecting)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+
+        recorder.connections[1].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(viewModel.state == .connected)
+        #expect(viewModel.clockDevicesSectionPresentation.deviceName == "Clock 0")
+        #expect(viewModel.clockDevicesSectionPresentation.action == .disconnect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func rememberedConnectFailureShowsDynamicDeviceNotFoundAlertAfterRetryLimit() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(
+            makeBonjourLastDevice(
+                boardID: 12,
+                displayName: "ESP32 Clock 12",
+                serviceInstanceName: "ESP32 Clock 12",
+                hostname: "esp32-clock-12.local"
+            ),
+            to: defaults
+        )
+        let viewModel = makeViewModelForConnectionIndicatorTests(recorder: recorder, userDefaults: defaults)
+
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.failed(.posix(.ECONNREFUSED)))
+        await drainMainQueue()
+        recorder.connections[1].stateUpdateHandler?(.failed(.posix(.ECONNREFUSED)))
+        await drainMainQueue()
+
+        let alert = try #require(viewModel.rememberedDeviceConnectionFailureAlert)
+        #expect(viewModel.state == .disconnected)
+        #expect(viewModel.clockDevicesSectionPresentation.deviceName == "Clock 12")
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connect)
+        #expect(viewModel.canConnectRememberedDevice)
+        #expect(recorder.connections.count == ESP32ControllerViewModel.manualRememberedConnectionMaxAttempts)
+        #expect(alert.title == "Device Not Found")
+        #expect(alert.message == "Clock 12 was not found. Check that the device is powered on and connected to the network.")
+    }
+
+    @MainActor
+    @Test func staleManualConnectDeadlineDoesNotFailNewerSuccessfulConnection() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let manualScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(displayName: "ESP32 Clock 0", serviceInstanceName: "ESP32 Clock 0"), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            manualConnectScheduler: manualScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+        let staleDeadline = try #require(manualScheduler.tasks.first)
+
+        viewModel.disconnect()
+        await drainMainQueue()
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+        recorder.connections[1].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        staleDeadline.fireIgnoringCancellationForTesting()
+        await drainMainQueue()
+
+        #expect(viewModel.state == .connected)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .disconnect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func manualDisconnectDuringRememberedConnectCancelsDeadlineAndSuppressesAlert() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let manualScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(displayName: "ESP32 Clock 0", serviceInstanceName: "ESP32 Clock 0"), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            manualConnectScheduler: manualScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+        viewModel.disconnect()
+        await drainMainQueue()
+
+        #expect(manualScheduler.tasks[0].isCancelled)
+        manualScheduler.tasks[0].fireIgnoringCancellationForTesting()
+        await drainMainQueue()
+
+        #expect(viewModel.state == .disconnected)
+        #expect(viewModel.clockDevicesSectionPresentation.deviceName == "Clock 0")
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func networkingDeauthorizationDuringRememberedConnectCancelsDeadlineAndSuppressesAlert() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let manualScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(displayName: "ESP32 Clock 0", serviceInstanceName: "ESP32 Clock 0"), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            manualConnectScheduler: manualScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+        viewModel.revokeNetworkingAuthorization()
+        await drainMainQueue()
+
+        #expect(!viewModel.isNetworkingAuthorized)
+        #expect(manualScheduler.tasks[0].isCancelled)
+
+        manualScheduler.tasks[0].fireIgnoringCancellationForTesting()
+        await drainMainQueue()
+
+        #expect(viewModel.state == .disconnected)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func automaticReconnectFailureDoesNotShowRememberedDeviceAlert() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(displayName: "ESP32 Clock 0", serviceInstanceName: "ESP32 Clock 0"), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(recorder: recorder, userDefaults: defaults)
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.failed(.posix(.ECONNREFUSED)))
+        await drainMainQueue()
+
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
     @Test func deterministicSortingUsesBoardIDThenServiceNameThenEndpoint() {
         let unsorted = [
             makeDevice(id: "service-c", serviceName: "Clock C", boardID: nil),
@@ -2163,7 +2557,7 @@ struct ESP32ControllerTests {
         viewModel.requestNextDisplayMode()
 
         #expect(recorder.connections.isEmpty)
-        #expect(viewModel.displayModeChangeState == .failed("Connect to an ESP32 before sending clock commands."))
+        #expect(viewModel.displayModeChangeState == .failed("Connect to a CLOCK before sending clock commands."))
     }
 
     @MainActor
@@ -2504,7 +2898,7 @@ struct ESP32ControllerTests {
         viewModel.restoreDefaultLogo()
 
         #expect(recorder.connections.isEmpty)
-        #expect(viewModel.defaultLogoRestoreState == .failed("Connect to an ESP32 before sending clock commands."))
+        #expect(viewModel.defaultLogoRestoreState == .failed("Connect to a CLOCK before sending clock commands."))
     }
 
     @MainActor
@@ -2668,8 +3062,8 @@ struct ESP32ControllerTests {
         receive(Data(expectedDLResponse(boardID: 0, result: 0x02)), nil, false, nil)
         await drainMainQueue()
 
-        #expect(viewModel.defaultLogoRestoreState == .failed("The ESP32 could not remove the SD-card logo."))
-        #expect(viewModel.commandStatusMessage == "The ESP32 could not remove the SD-card logo.")
+        #expect(viewModel.defaultLogoRestoreState == .failed("The CLOCK could not remove the SD-card logo."))
+        #expect(viewModel.commandStatusMessage == "The CLOCK could not remove the SD-card logo.")
         #expect(!viewModel.isDefaultLogoRestoreSuccessAlertPresented)
     }
 
@@ -3033,6 +3427,25 @@ struct ESP32ControllerTests {
         let recorder = FakeTCPConnectionRecorder()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0")
 
+        viewModel.requestDeviceReset(resetID: 0x00)
+
+        #expect(recorder.connections[0].sendCallCount == 1)
+        #expect(recorder.connections[0].sentContents.map { $0.map(Array.init) } == [
+            [0x2F, 0x54, 0x41, 0x00, 0x52, 0x54, 0x00, 0x5C]
+        ])
+    }
+
+    @MainActor
+    @Test func clockFactoryResetPresentationStillUsesExistingConfirmationAndRTPath() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0")
+
+        viewModel.isResetConfirmationPresented = true
+        viewModel.isResetConfirmationPresented = false
+
+        #expect(recorder.connections[0].sendCallCount == 0)
+
+        viewModel.isResetConfirmationPresented = true
         viewModel.requestDeviceReset(resetID: 0x00)
 
         #expect(recorder.connections[0].sendCallCount == 1)
@@ -3504,7 +3917,10 @@ struct ESP32ControllerTests {
 
         viewModel.handleAppBecameActive()
         await drainMainQueue()
-        #expect(reconnectScheduler.tasks.map(\.delay) == [0.5, 1, 2])
+        #expect(reconnectScheduler.tasks.map(\.delay) == [
+            0.5,
+            ESP32ControllerViewModel.automaticReconnectDeadline
+        ])
 
         recorder.connections[0].stateUpdateHandler?(.ready)
         await drainMainQueue()
@@ -3523,9 +3939,8 @@ struct ESP32ControllerTests {
         await drainMainQueue()
         boundedScheduler.tasks[0].fire()
         boundedScheduler.tasks[1].fire()
-        boundedScheduler.tasks[2].fire()
         await drainMainQueue()
-        #expect(boundedRecorder.connections.count == 4)
+        #expect(boundedRecorder.connections.count == ESP32ControllerViewModel.startupAutomaticReconnectMaxAttempts)
     }
 
     @MainActor
@@ -3543,16 +3958,265 @@ struct ESP32ControllerTests {
         viewModel.handleAppBecameActive()
         await drainMainQueue()
         reconnectScheduler.tasks[0].fire()
-        reconnectScheduler.tasks[1].fire()
-        reconnectScheduler.tasks[2].fire()
         await drainMainQueue()
 
-        recorder.connections[3].stateUpdateHandler?(.failed(.posix(.ECONNREFUSED)))
+        recorder.connections[1].stateUpdateHandler?(.failed(.posix(.ECONNREFUSED)))
         await drainMainQueue()
 
         #expect(viewModel.connectionStatusText != "Reconnecting to Clock 0…")
         #expect(viewModel.resumeActionDiagnosticsText == "Idle")
         #expect(viewModel.endpointSourceDiagnosticsText == "None")
+    }
+
+    @MainActor
+    @Test func startupReconnectDeadlineExpiresWithDeviceNotFoundAndKeepsRememberedName() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let reconnectScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            reconnectScheduler: reconnectScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+
+        #expect(recorder.connections.count == 1)
+        #expect(viewModel.connectionStatusText == "Reconnecting to Clock 0…")
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connecting)
+        #expect(reconnectScheduler.tasks.map(\.delay) == [
+            0.5,
+            ESP32ControllerViewModel.automaticReconnectDeadline
+        ])
+
+        let deadline = try #require(reconnectScheduler.tasks.last)
+        deadline.fire()
+        await drainMainQueue()
+
+        let alert = try #require(viewModel.rememberedDeviceConnectionFailureAlert)
+        #expect(viewModel.state == .disconnected)
+        #expect(viewModel.clockDevicesSectionPresentation.deviceName == "Clock 0")
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connect)
+        #expect(viewModel.canConnectRememberedDevice)
+        #expect(viewModel.lastConnectedDevice?.presentedDisplayName == "Clock 0")
+        #expect(alert.title == "Device Not Found")
+        #expect(alert.message == "Clock 0 was not found. Check that the device is powered on and connected to the network.")
+        #expect(recorder.connections[0].cancelCallCount >= 1)
+
+        viewModel.dismissRememberedDeviceConnectionFailureAlert()
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+
+        #expect(recorder.connections.count == 1)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connect)
+
+        viewModel.connectToRememberedDevice()
+        await drainMainQueue()
+        #expect(recorder.connections.count == 2)
+        recorder.connections[1].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(viewModel.state == .connected)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .disconnect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func startupReconnectSuccessCancelsDeadlineAndIgnoresStaleTimeout() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let reconnectScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            reconnectScheduler: reconnectScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+        let deadline = try #require(reconnectScheduler.tasks.last)
+
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(deadline.isCancelled)
+        #expect(viewModel.state == .connected)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .disconnect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+
+        deadline.fireIgnoringCancellationForTesting()
+        await drainMainQueue()
+
+        #expect(viewModel.state == .connected)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .disconnect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func startupReconnectRetriesOnceAndSecondAttemptCanSucceed() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let reconnectScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            reconnectScheduler: reconnectScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+        reconnectScheduler.tasks[0].fire()
+        await drainMainQueue()
+
+        #expect(recorder.connections.count == ESP32ControllerViewModel.startupAutomaticReconnectMaxAttempts)
+
+        recorder.connections[1].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(viewModel.state == .connected)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .disconnect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func startupReconnectFinalFailureUsesDynamicDeviceNotFoundAlert() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let reconnectScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(
+            makeBonjourLastDevice(
+                boardID: 12,
+                displayName: "ESP32 Clock 12",
+                serviceInstanceName: "ESP32 Clock 12",
+                hostname: "esp32-clock-12.local"
+            ),
+            to: defaults
+        )
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            reconnectScheduler: reconnectScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+        reconnectScheduler.tasks[0].fire()
+        await drainMainQueue()
+        recorder.connections[1].stateUpdateHandler?(.failed(.posix(.ECONNREFUSED)))
+        await drainMainQueue()
+
+        let alert = try #require(viewModel.rememberedDeviceConnectionFailureAlert)
+        #expect(viewModel.state == .disconnected)
+        #expect(viewModel.clockDevicesSectionPresentation.deviceName == "Clock 12")
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connect)
+        #expect(alert.title == "Device Not Found")
+        #expect(alert.message == "Clock 12 was not found. Check that the device is powered on and connected to the network.")
+        #expect(recorder.connections.count == ESP32ControllerViewModel.startupAutomaticReconnectMaxAttempts)
+    }
+
+    @MainActor
+    @Test func backgroundAutomaticReconnectFailureRemainsSilentAfterStartupEvaluation() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let reconnectScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            reconnectScheduler: reconnectScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+        recorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+        viewModel.handleAppEnteredBackground()
+        await drainMainQueue()
+
+        let existingTaskCount = reconnectScheduler.tasks.count
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+
+        let backgroundTasks = Array(reconnectScheduler.tasks.dropFirst(existingTaskCount))
+        #expect(backgroundTasks.map(\.delay) == [
+            0.5,
+            1,
+            2,
+            ESP32ControllerViewModel.automaticReconnectDeadline
+        ])
+
+        backgroundTasks[0].fire()
+        await drainMainQueue()
+        backgroundTasks[1].fire()
+        await drainMainQueue()
+        backgroundTasks[2].fire()
+        await drainMainQueue()
+
+        #expect(recorder.connections.count == 5)
+        recorder.connections[4].stateUpdateHandler?(.failed(.posix(.ECONNREFUSED)))
+        await drainMainQueue()
+
+        #expect(viewModel.state == .disconnected)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+    }
+
+    @MainActor
+    @Test func explicitDisconnectInvalidatesStartupReconnectAndSuppressesAlert() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let reconnectScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            reconnectScheduler: reconnectScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+        let deadline = try #require(reconnectScheduler.tasks.last)
+
+        viewModel.disconnect()
+        await drainMainQueue()
+        deadline.fireIgnoringCancellationForTesting()
+        await drainMainQueue()
+
+        #expect(viewModel.state == .disconnected)
+        #expect(viewModel.clockDevicesSectionPresentation.action == .connect)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
+        #expect(viewModel.autoReconnectDiagnosticsText == "Disabled")
+    }
+
+    @MainActor
+    @Test func networkingDeauthorizationInvalidatesStartupReconnectAndSuppressesAlert() async throws {
+        let recorder = FakeTCPConnectionRecorder()
+        let reconnectScheduler = FakeHeartbeatScheduler()
+        let defaults = makeIsolatedUserDefaults()
+        saveLastConnectedDevice(makeBonjourLastDevice(), to: defaults)
+        let viewModel = makeViewModelForConnectionIndicatorTests(
+            recorder: recorder,
+            reconnectScheduler: reconnectScheduler.schedule(_:_:),
+            userDefaults: defaults
+        )
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+        let deadline = try #require(reconnectScheduler.tasks.last)
+
+        viewModel.revokeNetworkingAuthorization()
+        await drainMainQueue()
+        deadline.fireIgnoringCancellationForTesting()
+        await drainMainQueue()
+
+        #expect(!viewModel.isNetworkingAuthorized)
+        #expect(viewModel.state == .disconnected)
+        #expect(viewModel.rememberedDeviceConnectionFailureAlert == nil)
     }
 
     @MainActor
@@ -7705,6 +8369,11 @@ private func makeViewModelForConnectionIndicatorTests(
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
         return TestDispatchWorkItemCancellable(workItem: workItem)
     },
+    manualConnectScheduler: @escaping ESP32ControllerViewModel.TimeSyncScheduler = { delay, callback in
+        let workItem = DispatchWorkItem(block: callback)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        return TestDispatchWorkItemCancellable(workItem: workItem)
+    },
     userDefaults: UserDefaults = .standard
 ) -> ESP32ControllerViewModel {
     let client = ESP32TCPClient(
@@ -7728,6 +8397,7 @@ private func makeViewModelForConnectionIndicatorTests(
         currentDateProvider: currentDateProvider,
         timeSyncScheduler: timeSyncScheduler,
         reconnectScheduler: reconnectScheduler,
+        manualConnectScheduler: manualConnectScheduler,
         userDefaults: userDefaults
     )
     viewModel.authorizeNetworking()
