@@ -405,6 +405,21 @@ final class ESP32TCPClient {
             return buffer[alarmResponseLength - 1] == Self.frameDelimiter ? .complete(alarmResponseLength) : .notExactLength
         }
 
+        if buffer[0] == 0x2F,
+           buffer[1] == 0x74,
+           buffer[2] == 0x61,
+           buffer[4] == 0x72,
+           buffer[5] == 0x63 {
+            let configurationResponseLength = ClockConfigurationProtocolCodec.responseLength
+            guard buffer.count >= configurationResponseLength else {
+                return .incomplete
+            }
+
+            return buffer[configurationResponseLength - 1] == Self.frameDelimiter
+                ? .complete(configurationResponseLength)
+                : .notExactLength
+        }
+
         return .notExactLength
     }
 

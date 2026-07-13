@@ -194,6 +194,23 @@ struct ContentView: View {
                     .disabled(!viewModel.canUseClockControls)
             }
 
+            switch viewModel.clockConfigurationReadState {
+            case .loading:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading clock settings...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            case let .failed(message):
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            case .idle, .loaded:
+                EmptyView()
+            }
+
         }
     }
 

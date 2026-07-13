@@ -7,6 +7,10 @@
 
 import SwiftUI
 
+enum AlarmSectionPresentation {
+    static let showsManualReadButton = false
+}
+
 struct AlarmSectionView: View {
     @ObservedObject var viewModel: ESP32ControllerViewModel
 
@@ -18,17 +22,8 @@ struct AlarmSectionView: View {
     var body: some View {
         Section("Alarms") {
             VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .center, spacing: 12) {
-                    alarmReadStatus
-                    Spacer(minLength: 12)
-                    Button {
-                        viewModel.readAllAlarms()
-                    } label: {
-                        Label("Read Alarms", systemImage: "arrow.down.circle")
-                    }
-                    .disabled(!viewModel.canReadAlarms)
-                }
-                .padding(.bottom, 46)
+                alarmReadStatus
+                    .padding(.bottom, 8)
 
                 if case let .reading(_, completed, total) = viewModel.alarmReadOperationState {
                     ProgressView(value: Double(completed), total: Double(total))

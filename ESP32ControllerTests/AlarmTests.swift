@@ -371,6 +371,29 @@ struct AlarmTests {
     }
 
     @MainActor
+    @Test func tcpParserKeepsDelimiterByteInsideFixedLengthRCResponse() async throws {
+        let connection = AlarmFakeTCPConnection()
+        let client = ESP32TCPClient(connectionFactory: { _, _ in connection })
+        var frames: [[UInt8]] = []
+        client.onFrameReceived = { frames.append($0) }
+        client.connect(host: "192.168.4.1", port: ESP32TCPClient.defaultPort, boardID: nil)
+        connection.stateUpdateHandler?(.ready)
+        await alarmDrainMainQueue()
+
+        let configuration: [UInt8] = [
+            0x2F, 0x74, 0x61, 0x00, 0x72, 0x63,
+            0x01, 0x01, 0x5C, 0x05, 0x04, 0x03, 0x02, 0x01, 0x07, 0x1A,
+            0x5C
+        ]
+        let trailingNM: [UInt8] = [0x2F, 0x74, 0x61, 0x00, 0x6E, 0x6D, 0x02, 0x5C]
+        let receive = try #require(connection.lastReceiveCompletion)
+        receive(Data(configuration + trailingNM), nil, false, nil)
+        await alarmDrainMainQueue()
+
+        #expect(frames == [configuration, trailingNM])
+    }
+
+    @MainActor
     @Test func tcpParserEmitsFragmentedDAACKAsOneFrame() async throws {
         let connection = AlarmFakeTCPConnection()
         let client = ESP32TCPClient(connectionFactory: { _, _ in connection })
@@ -1601,7 +1624,8 @@ private func connectedAlarmViewModel(
     let viewModel = ESP32ControllerViewModel(
         client: client,
         timeSyncScheduler: scheduler.schedule(_:_:),
-        automaticallyReadsPalettesOnConnect: false
+        automaticallyReadsPalettesOnConnect: false,
+        automaticallyLoadsClockStateOnConnect: false
     )
     viewModel.authorizeNetworking()
     viewModel.manualBoardID = "0"

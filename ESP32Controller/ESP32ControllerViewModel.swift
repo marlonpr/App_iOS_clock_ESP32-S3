@@ -43,6 +43,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
     }
     @Published var commandStatusMessage: String?
+    @Published private(set) var clockConfigurationReadState: ClockConfigurationReadState = .idle
     @Published var isResetConfirmationPresented = false
     @Published var isRestoreDefaultLogoConfirmationPresented = false
     @Published private(set) var timeSyncState: TimeSyncState = .idle
@@ -51,6 +52,7 @@ final class ESP32ControllerViewModel: ObservableObject {
     @Published private(set) var confirmedDisplayMode: UInt8?
     @Published private(set) var isDisplayModeSuccessAlertPresented = false
     @Published private(set) var setDisplayModeState: SetDisplayModeState = .idle
+    @Published private(set) var readDisplayModeState: ReadDisplayModeState = .idle
     @Published private(set) var defaultLogoRestoreState: DefaultLogoRestoreState = .idle
     @Published private(set) var isDefaultLogoRestoreSuccessAlertPresented = false
     @Published private(set) var logoUploadState: LogoUploadState = .idle
@@ -96,8 +98,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     nonisolated static let timeSyncCompensation: TimeInterval = 1.0
     nonisolated static let timeSyncConfirmationTimeout: TimeInterval = 4
     nonisolated static let setDisplayModeConfirmationTimeout: TimeInterval = 4
+    nonisolated static let readDisplayModeTimeout: TimeInterval = 4
     nonisolated static let defaultLogoRestoreConfirmationTimeout: TimeInterval = 4
     nonisolated static let alarmTransactionTimeout: TimeInterval = 4
+    nonisolated static let clockConfigurationReadTimeout: TimeInterval = 4
     nonisolated static let paletteTransactionTimeout: TimeInterval = 4
     nonisolated static let paletteUnsupportedFirmwareMessage = "Color Palette requires newer CLOCK firmware"
     nonisolated static let foregroundHeartbeatValidationTimeout: TimeInterval = 1.75
@@ -117,6 +121,7 @@ final class ESP32ControllerViewModel: ObservableObject {
     private let logoUploadClient: ESP32LogoUploadClient
     private let userDefaults: UserDefaults
     private let automaticallyReadsPalettesOnConnect: Bool
+    private let automaticallyLoadsClockStateOnConnect: Bool
     private let maxLogEntries = 200
     nonisolated static let lastConnectedDeviceDefaultsKey = "ESP32Controller.LastConnectedDevice.v1"
     private var pendingConnectionEndpointDescription: String?
@@ -148,6 +153,12 @@ final class ESP32ControllerViewModel: ObservableObject {
     private var didValidateActiveConnectionGeneration: UUID?
     private var brightnessLevelAtEditingStart: UInt8?
     private var lastRequestedClockConfiguration: ClockConfiguration?
+    private var timeFormatUserEditRevision = 0
+    private var brightnessUserEditRevision = 0
+    private var pendingClockConfigurationRead: PendingClockConfigurationRead?
+    private var clockConfigurationReadTimeoutTask: CancellableTask?
+    private var automaticStartupLoadConnectionGeneration: UUID?
+    private var automaticStartupLoadPhase: AutomaticStartupLoadPhase = .idle
     private var pendingTimeSyncOperationID: UUID?
     private var pendingTimeSyncConnectionGeneration: UUID?
     private var timeSyncConfirmationTimeoutTask: CancellableTask?
@@ -159,6 +170,8 @@ final class ESP32ControllerViewModel: ObservableObject {
     private var pendingSetDisplayModeBoardID: UInt8?
     private var pendingSetDisplayModeTarget: PaletteMode?
     private var setDisplayModeConfirmationTimeoutTask: CancellableTask?
+    private var pendingReadDisplayModeOperation: PendingReadDisplayModeOperation?
+    private var readDisplayModeTimeoutTask: CancellableTask?
     private var pendingDefaultLogoRestoreOperationID: UUID?
     private var pendingDefaultLogoRestoreConnectionGeneration: UUID?
     private var pendingDefaultLogoRestoreBoardID: UInt8?
@@ -179,7 +192,11 @@ final class ESP32ControllerViewModel: ObservableObject {
     private var pendingAlarmReadQueue: [Int] = []
     private var pendingAlarmReadTotal = 0
     private var alarmReadSuccesses = 0
+    private var pendingAlarmReadIsFullSnapshot = false
     private var alarmReadTimeoutTask: CancellableTask?
+    private var activeAlarmCacheDeviceIdentity: AlarmCacheDeviceIdentity?
+    private var loadedAlarmCacheDeviceIdentity: AlarmCacheDeviceIdentity?
+    private var alarmRecordsDeviceIdentity: AlarmCacheDeviceIdentity?
     private var pendingAlarmWriteOperationID: UUID?
     private var pendingAlarmWriteConnectionGeneration: UUID?
     private var pendingAlarmWriteBoardID: UInt8?
@@ -229,6 +246,11 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     var canUseClockControls: Bool {
         isNetworkingAuthorized && state == .connected && connectedProtocolBoardID != nil
+    }
+
+    var hasLoadedAlarmsForCurrentDevice: Bool {
+        let currentIdentity = activeAlarmCacheDeviceIdentity ?? lastConnectedDevice.map(Self.alarmCacheIdentity)
+        return currentIdentity != nil && currentIdentity == loadedAlarmCacheDeviceIdentity
     }
 
     var canSyncTime: Bool {
@@ -506,6 +528,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         },
         logoUploadClient: ESP32LogoUploadClient? = nil,
         automaticallyReadsPalettesOnConnect: Bool = true,
+        automaticallyLoadsClockStateOnConnect: Bool = true,
         userDefaults: UserDefaults = .standard
     ) {
         self.client = client ?? ESP32TCPClient()
@@ -517,6 +540,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         self.logoImageConverter = logoImageConverter
         self.logoUploadClient = logoUploadClient ?? ESP32LogoUploadClient()
         self.automaticallyReadsPalettesOnConnect = automaticallyReadsPalettesOnConnect
+        self.automaticallyLoadsClockStateOnConnect = automaticallyLoadsClockStateOnConnect
         self.userDefaults = userDefaults
         self.lastConnectedDevice = Self.loadLastConnectedDevice(from: userDefaults)
 
@@ -536,6 +560,7 @@ final class ESP32ControllerViewModel: ObservableObject {
                 self.appendEvent(state.title)
                 if presentationState == .connected {
                     self.startPaletteBootstrapIfNeeded()
+                    self.startAutomaticStartupLoadIfNeeded()
                 }
             }
         }
@@ -615,6 +640,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         alarmDeleteTimeoutTask?.cancel()
         paletteTransactionTimeoutTask?.cancel()
         setDisplayModeConfirmationTimeoutTask?.cancel()
+        clockConfigurationReadTimeoutTask?.cancel()
     }
 
     func authorizeNetworking() {
@@ -1189,6 +1215,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             return
         }
 
+        timeFormatUserEditRevision += 1
         is24HourFormat = is24Hour
         sendCurrentClockConfiguration(
             reason: .timeFormat,
@@ -1198,6 +1225,7 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     func brightnessEditingChanged(_ isEditing: Bool) {
         if isEditing {
+            brightnessUserEditRevision += 1
             brightnessLevelAtEditingStart = roundedBrightnessLevel
         } else {
             userFinishedBrightnessSelection()
@@ -1309,7 +1337,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             return
         }
 
-        sendClockCommand(.readConfiguration)
+        beginClockConfigurationRead(isAutomatic: false)
     }
 
     func requestNextDisplayMode() {
@@ -1463,6 +1491,10 @@ final class ESP32ControllerViewModel: ObservableObject {
             commandStatusMessage = error.localizedDescription
             appendEvent(error.localizedDescription)
         }
+    }
+
+    func requestCurrentDisplayMode() {
+        beginReadDisplayMode(isAutomatic: false)
     }
 
     func sendCurrentClockConfiguration() {
@@ -1885,6 +1917,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             onSendSucceeded: { [weak self] in
                 if tracksDeviceDefaultConfiguration {
                     self?.invalidatePaletteStateAfterFactoryReset()
+                    self?.invalidateAlarmCacheAfterFactoryReset()
                 }
             },
             onSendFinished: { [weak self] in
@@ -2255,11 +2288,91 @@ final class ESP32ControllerViewModel: ObservableObject {
         sendNextPaletteRead()
     }
 
+    private func startAutomaticStartupLoadIfNeeded() {
+        guard
+            automaticallyLoadsClockStateOnConnect,
+            isNetworkingAuthorized,
+            state == .connected,
+            let connectionGeneration = activeConnectionGeneration,
+            connectedProtocolBoardID != nil,
+            automaticStartupLoadConnectionGeneration != connectionGeneration
+        else {
+            return
+        }
+
+        automaticStartupLoadConnectionGeneration = connectionGeneration
+        automaticStartupLoadPhase = .waitingForPalettes
+        continueAutomaticStartupLoadAfterPalettesIfNeeded()
+    }
+
+    private func continueAutomaticStartupLoadAfterPalettesIfNeeded() {
+        guard
+            automaticallyLoadsClockStateOnConnect,
+            automaticStartupLoadPhase == .waitingForPalettes,
+            let connectionGeneration = automaticStartupLoadConnectionGeneration,
+            connectionGeneration == activeConnectionGeneration,
+            state == .connected,
+            isNetworkingAuthorized
+        else {
+            return
+        }
+
+        if paletteBootstrapConnectionGeneration == connectionGeneration,
+           pendingPaletteOperation != nil || !pendingPaletteReadQueue.isEmpty {
+            return
+        }
+
+        automaticStartupLoadPhase = .readingDisplayMode
+        beginReadDisplayMode(isAutomatic: true)
+    }
+
+    private func continueAutomaticStartupLoadAfterDisplayModeIfNeeded(
+        connectionGeneration: UUID
+    ) {
+        guard
+            automaticallyLoadsClockStateOnConnect,
+            automaticStartupLoadPhase == .readingDisplayMode,
+            automaticStartupLoadConnectionGeneration == connectionGeneration,
+            activeConnectionGeneration == connectionGeneration,
+            state == .connected,
+            isNetworkingAuthorized
+        else {
+            return
+        }
+
+        automaticStartupLoadPhase = .readingConfiguration
+        beginClockConfigurationRead(isAutomatic: true)
+    }
+
+    private func continueAutomaticStartupLoadAfterConfigurationIfNeeded(
+        connectionGeneration: UUID
+    ) {
+        guard
+            automaticallyLoadsClockStateOnConnect,
+            automaticStartupLoadPhase == .readingConfiguration,
+            automaticStartupLoadConnectionGeneration == connectionGeneration,
+            activeConnectionGeneration == connectionGeneration,
+            state == .connected,
+            isNetworkingAuthorized
+        else {
+            return
+        }
+
+        guard !alarmCacheIsValidForActiveDevice else {
+            automaticStartupLoadPhase = .complete
+            return
+        }
+
+        automaticStartupLoadPhase = .readingAlarms
+        beginAlarmRead(ids: Array(AlarmRecord.validIDRange), total: AlarmRecord.maximumAlarmCount)
+    }
+
     private func sendNextPaletteRead() {
         guard pendingPaletteOperation == nil else {
             return
         }
         guard !pendingPaletteReadQueue.isEmpty else {
+            continueAutomaticStartupLoadAfterPalettesIfNeeded()
             return
         }
 
@@ -2269,6 +2382,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         } catch {
             pendingPaletteReadQueue.removeAll()
             failPaletteRead(mode: mode, error: error)
+            continueAutomaticStartupLoadAfterPalettesIfNeeded()
         }
     }
 
@@ -2386,6 +2500,7 @@ final class ESP32ControllerViewModel: ObservableObject {
                     if status.indicatesUnsupportedFirmware {
                         pendingPaletteReadQueue.removeAll()
                         markPaletteFeatureUnsupported()
+                        continueAutomaticStartupLoadAfterPalettesIfNeeded()
                     } else {
                         sendNextPaletteRead()
                     }
@@ -2487,6 +2602,9 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
         if markUnsupported {
             markPaletteFeatureUnsupported()
+        }
+        if operation.kind == .read {
+            continueAutomaticStartupLoadAfterPalettesIfNeeded()
         }
     }
 
@@ -2612,8 +2730,359 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
     }
 
+    private func beginReadDisplayMode(isAutomatic: Bool) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+        guard pendingReadDisplayModeOperation == nil else {
+            return
+        }
+        guard
+            state == .connected,
+            let connectionGeneration = activeConnectionGeneration,
+            let boardID = connectedProtocolBoardID
+        else {
+            if !isAutomatic {
+                let message = "Connect to a CLOCK before reading display mode."
+                readDisplayModeState = .failed(message)
+                commandStatusMessage = message
+                appendEvent(message)
+            }
+            return
+        }
+
+        let operation = PendingReadDisplayModeOperation(
+            id: UUID(),
+            connectionGeneration: connectionGeneration,
+            boardID: boardID,
+            isAutomatic: isAutomatic
+        )
+
+        do {
+            let command = ClockProtocolCommand.readDisplayMode
+            let bytes = try ClockProtocolEncoder.encode(command, boardID: boardID)
+            pendingReadDisplayModeOperation = operation
+            readDisplayModeState = .loading
+
+            client.send(Data(bytes)) { [weak self] error in
+                DispatchQueue.main.async {
+                    guard let self, self.isCurrentReadDisplayModeOperation(operation) else {
+                        return
+                    }
+
+                    if let error {
+                        self.finishReadDisplayMode(
+                            operation,
+                            failureMessage: "Could not load display mode. \(error.localizedDescription)"
+                        )
+                    } else {
+                        self.appendLog(direction: .outgoing, bytes: bytes, message: command.logLabel)
+                        self.scheduleReadDisplayModeTimeout(for: operation)
+                    }
+                }
+            }
+        } catch {
+            readDisplayModeState = .failed(error.localizedDescription)
+            commandStatusMessage = error.localizedDescription
+            appendEvent(error.localizedDescription)
+            if isAutomatic {
+                continueAutomaticStartupLoadAfterDisplayModeIfNeeded(
+                    connectionGeneration: connectionGeneration
+                )
+            }
+        }
+    }
+
+    private func consumeReadDisplayModeResponseIfExpected(_ bytes: [UInt8]) -> Bool {
+        guard
+            let operation = pendingReadDisplayModeOperation,
+            isCurrentReadDisplayModeOperation(operation),
+            isReadDisplayModeResponseCandidate(bytes, boardID: operation.boardID)
+        else {
+            return false
+        }
+
+        do {
+            let acknowledgement = try ReadModeProtocolCodec.decodeResponse(
+                bytes,
+                expectedBoardID: operation.boardID
+            )
+            guard acknowledgement.status == .success, let mode = acknowledgement.mode else {
+                finishReadDisplayMode(
+                    operation,
+                    failureMessage: "Could not load display mode. \(acknowledgement.status.message)"
+                )
+                appendLog(
+                    direction: .incoming,
+                    bytes: bytes,
+                    message: "RM Read Display Mode Failed \(acknowledgement.status.uppercaseHex)"
+                )
+                return true
+            }
+
+            cancelReadDisplayModeTimeout()
+            pendingReadDisplayModeOperation = nil
+            confirmedDisplayMode = mode.rawValue
+            readDisplayModeState = .loaded(mode: mode.rawValue)
+            if mode.isEditable {
+                selectedPaletteMode = mode
+            }
+            commandStatusMessage = "Display mode loaded."
+            appendLog(direction: .incoming, bytes: bytes, message: "RM Display Mode \(mode.rawValue) Loaded")
+            if operation.isAutomatic {
+                continueAutomaticStartupLoadAfterDisplayModeIfNeeded(
+                    connectionGeneration: operation.connectionGeneration
+                )
+            }
+        } catch {
+            finishReadDisplayMode(
+                operation,
+                failureMessage: "Could not load display mode. \(error.localizedDescription)"
+            )
+            appendLog(direction: .incoming, bytes: bytes, message: "RM Read Display Mode Invalid Response")
+        }
+
+        return true
+    }
+
+    private func isReadDisplayModeResponseCandidate(_ bytes: [UInt8], boardID: UInt8) -> Bool {
+        bytes.count >= 6 &&
+            bytes[0] == 0x2F &&
+            bytes[1] == 0x74 &&
+            bytes[2] == 0x61 &&
+            bytes[3] == boardID &&
+            bytes[4] == 0x72 &&
+            bytes[5] == 0x6D
+    }
+
+    private func isCurrentReadDisplayModeOperation(_ operation: PendingReadDisplayModeOperation) -> Bool {
+        pendingReadDisplayModeOperation?.id == operation.id &&
+            activeConnectionGeneration == operation.connectionGeneration &&
+            connectedProtocolBoardID == operation.boardID &&
+            state == .connected &&
+            isNetworkingAuthorized
+    }
+
+    private func scheduleReadDisplayModeTimeout(for operation: PendingReadDisplayModeOperation) {
+        cancelReadDisplayModeTimeout()
+        readDisplayModeTimeoutTask = timeSyncScheduler(Self.readDisplayModeTimeout) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.isCurrentReadDisplayModeOperation(operation) else {
+                    return
+                }
+
+                self.readDisplayModeTimeoutTask = nil
+                self.finishReadDisplayMode(
+                    operation,
+                    failureMessage: "Could not load display mode. Read timed out."
+                )
+            }
+        }
+    }
+
+    private func finishReadDisplayMode(
+        _ operation: PendingReadDisplayModeOperation,
+        failureMessage: String
+    ) {
+        guard pendingReadDisplayModeOperation?.id == operation.id else {
+            return
+        }
+
+        cancelReadDisplayModeTimeout()
+        pendingReadDisplayModeOperation = nil
+        readDisplayModeState = .failed(failureMessage)
+        commandStatusMessage = failureMessage
+        appendEvent(failureMessage)
+        if operation.isAutomatic {
+            continueAutomaticStartupLoadAfterDisplayModeIfNeeded(
+                connectionGeneration: operation.connectionGeneration
+            )
+        }
+    }
+
+    private func cancelReadDisplayModeTimeout() {
+        readDisplayModeTimeoutTask?.cancel()
+        readDisplayModeTimeoutTask = nil
+    }
+
+    private func beginClockConfigurationRead(isAutomatic: Bool) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+        guard pendingClockConfigurationRead == nil else {
+            return
+        }
+        guard
+            state == .connected,
+            let connectionGeneration = activeConnectionGeneration,
+            let boardID = connectedProtocolBoardID
+        else {
+            if !isAutomatic {
+                let message = "Connect to a CLOCK before reading clock settings."
+                clockConfigurationReadState = .failed(message)
+                commandStatusMessage = message
+                appendEvent(message)
+            }
+            return
+        }
+
+        let operation = PendingClockConfigurationRead(
+            id: UUID(),
+            connectionGeneration: connectionGeneration,
+            boardID: boardID,
+            isAutomatic: isAutomatic,
+            timeFormatUserEditRevision: timeFormatUserEditRevision,
+            brightnessUserEditRevision: brightnessUserEditRevision
+        )
+
+        do {
+            let command = ClockProtocolCommand.readConfiguration
+            let bytes = try ClockProtocolEncoder.encode(command, boardID: boardID)
+            pendingClockConfigurationRead = operation
+            clockConfigurationReadState = .loading
+
+            client.send(Data(bytes)) { [weak self] error in
+                DispatchQueue.main.async {
+                    guard let self, self.isCurrentClockConfigurationRead(operation) else {
+                        return
+                    }
+
+                    if let error {
+                        self.finishClockConfigurationRead(
+                            operation,
+                            failureMessage: "Could not load clock settings. \(error.localizedDescription)"
+                        )
+                    } else {
+                        self.appendLog(direction: .outgoing, bytes: bytes, message: command.logLabel)
+                        self.scheduleClockConfigurationReadTimeout(for: operation)
+                    }
+                }
+            }
+        } catch {
+            clockConfigurationReadState = .failed(error.localizedDescription)
+            commandStatusMessage = error.localizedDescription
+            appendEvent(error.localizedDescription)
+            if isAutomatic {
+                continueAutomaticStartupLoadAfterConfigurationIfNeeded(
+                    connectionGeneration: connectionGeneration
+                )
+            }
+        }
+    }
+
+    private func consumeClockConfigurationResponseIfExpected(_ bytes: [UInt8]) -> Bool {
+        guard
+            let operation = pendingClockConfigurationRead,
+            isCurrentClockConfigurationRead(operation),
+            isClockConfigurationResponseCandidate(bytes, boardID: operation.boardID)
+        else {
+            return false
+        }
+
+        do {
+            let readback = try ClockConfigurationProtocolCodec.decodeRCResponse(
+                bytes,
+                expectedBoardID: operation.boardID
+            )
+            cancelClockConfigurationReadTimeout()
+            pendingClockConfigurationRead = nil
+
+            if timeFormatUserEditRevision == operation.timeFormatUserEditRevision {
+                is24HourFormat = readback.is24HourFormat
+            }
+            if brightnessUserEditRevision == operation.brightnessUserEditRevision {
+                brightnessLevel = Double(readback.brightnessLevel)
+            }
+
+            clockConfigurationReadState = .loaded
+            commandStatusMessage = "Clock settings loaded."
+            appendLog(direction: .incoming, bytes: bytes, message: "RC Clock Settings Loaded")
+            if operation.isAutomatic {
+                continueAutomaticStartupLoadAfterConfigurationIfNeeded(
+                    connectionGeneration: operation.connectionGeneration
+                )
+            }
+        } catch {
+            finishClockConfigurationRead(
+                operation,
+                failureMessage: "Could not load clock settings. \(error.localizedDescription)"
+            )
+        }
+
+        return true
+    }
+
+    private func isClockConfigurationResponseCandidate(_ bytes: [UInt8], boardID: UInt8) -> Bool {
+        bytes.count >= 6 &&
+            bytes[0] == 0x2F &&
+            bytes[1] == 0x74 &&
+            bytes[2] == 0x61 &&
+            bytes[3] == boardID &&
+            bytes[4] == 0x72 &&
+            bytes[5] == 0x63
+    }
+
+    private func isCurrentClockConfigurationRead(_ operation: PendingClockConfigurationRead) -> Bool {
+        pendingClockConfigurationRead?.id == operation.id &&
+            pendingClockConfigurationRead?.connectionGeneration == operation.connectionGeneration &&
+            activeConnectionGeneration == operation.connectionGeneration &&
+            connectedProtocolBoardID == operation.boardID &&
+            state == .connected &&
+            isNetworkingAuthorized
+    }
+
+    private func scheduleClockConfigurationReadTimeout(for operation: PendingClockConfigurationRead) {
+        cancelClockConfigurationReadTimeout()
+        clockConfigurationReadTimeoutTask = timeSyncScheduler(Self.clockConfigurationReadTimeout) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.isCurrentClockConfigurationRead(operation) else {
+                    return
+                }
+
+                self.clockConfigurationReadTimeoutTask = nil
+                self.finishClockConfigurationRead(
+                    operation,
+                    failureMessage: "Could not load clock settings. Read timed out."
+                )
+            }
+        }
+    }
+
+    private func finishClockConfigurationRead(
+        _ operation: PendingClockConfigurationRead,
+        failureMessage: String
+    ) {
+        guard pendingClockConfigurationRead?.id == operation.id else {
+            return
+        }
+
+        cancelClockConfigurationReadTimeout()
+        pendingClockConfigurationRead = nil
+        clockConfigurationReadState = .failed(failureMessage)
+        commandStatusMessage = failureMessage
+        appendEvent(failureMessage)
+        if operation.isAutomatic {
+            continueAutomaticStartupLoadAfterConfigurationIfNeeded(
+                connectionGeneration: operation.connectionGeneration
+            )
+        }
+    }
+
+    private func cancelClockConfigurationReadTimeout() {
+        clockConfigurationReadTimeoutTask?.cancel()
+        clockConfigurationReadTimeoutTask = nil
+    }
+
     private func handleReceivedFrame(_ bytes: [UInt8]) {
         if consumePaletteResponseIfExpected(bytes) {
+            return
+        }
+
+        if consumeReadDisplayModeResponseIfExpected(bytes) {
+            return
+        }
+
+        if consumeClockConfigurationResponseIfExpected(bytes) {
             return
         }
 
@@ -3051,6 +3520,8 @@ final class ESP32ControllerViewModel: ObservableObject {
         pendingAlarmReadID = nil
         pendingAlarmReadQueue = ids
         pendingAlarmReadTotal = total
+        pendingAlarmReadIsFullSnapshot = ids == Array(AlarmRecord.validIDRange) &&
+            total == AlarmRecord.maximumAlarmCount
         alarmReadSuccesses = 0
         alarmReadFailures = 0
         lastAlarmReadID = nil
@@ -3200,6 +3671,8 @@ final class ESP32ControllerViewModel: ObservableObject {
         let successful = alarmReadSuccesses
         let failed = alarmReadFailures
         let total = pendingAlarmReadTotal
+        let completedFullSnapshot = pendingAlarmReadIsFullSnapshot
+        let completedDeviceIdentity = activeAlarmCacheDeviceIdentity
         alarmReadOperationState = .completed(successful: successful, failed: failed)
         pendingAlarmReadOperationID = nil
         pendingAlarmReadConnectionGeneration = nil
@@ -3207,7 +3680,17 @@ final class ESP32ControllerViewModel: ObservableObject {
         pendingAlarmReadID = nil
         pendingAlarmReadQueue.removeAll()
         pendingAlarmReadTotal = 0
+        pendingAlarmReadIsFullSnapshot = false
         cancelAlarmReadTimeout()
+
+        if completedFullSnapshot,
+           successful == AlarmRecord.maximumAlarmCount,
+           failed == 0,
+           total == AlarmRecord.maximumAlarmCount,
+           let completedDeviceIdentity {
+            loadedAlarmCacheDeviceIdentity = completedDeviceIdentity
+            alarmRecordsDeviceIdentity = completedDeviceIdentity
+        }
 
         let summary: String
         if failed == 0 {
@@ -3217,6 +3700,10 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
         commandStatusMessage = summary
         appendEvent(summary)
+        if automaticStartupLoadPhase == .readingAlarms,
+           automaticStartupLoadConnectionGeneration == activeConnectionGeneration {
+            automaticStartupLoadPhase = .complete
+        }
     }
 
     private func cancelAlarmReadTimeout() {
@@ -3234,6 +3721,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         pendingAlarmReadID = nil
         pendingAlarmReadQueue.removeAll()
         pendingAlarmReadTotal = 0
+        pendingAlarmReadIsFullSnapshot = false
 
         guard markInterrupted, wasReading else {
             if !markInterrupted {
@@ -3448,6 +3936,7 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     private func clearAlarmOperationsForConnectionChange(markInterrupted: Bool) {
         clearPendingAlarmRead(markInterrupted: markInterrupted)
+        activeAlarmCacheDeviceIdentity = nil
 
         if case let .sending(id) = alarmSendState {
             cancelAlarmWriteTimeout()
@@ -3514,11 +4003,14 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     private func clearDisplayModeStateForConnectionChange() {
         cancelDisplayModeTasks()
+        cancelReadDisplayModeTimeout()
+        pendingReadDisplayModeOperation = nil
         pendingDisplayModeOperationID = nil
         pendingDisplayModeConnectionGeneration = nil
         isDisplayModeSuccessAlertPresented = false
         confirmedDisplayMode = nil
         displayModeChangeState = .idle
+        readDisplayModeState = .idle
         clearSetDisplayModeStateForConnectionChange()
     }
 
@@ -3532,6 +4024,11 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     private func clearClockConfigurationCacheForConnectionChange() {
+        cancelClockConfigurationReadTimeout()
+        pendingClockConfigurationRead = nil
+        clockConfigurationReadState = .idle
+        automaticStartupLoadConnectionGeneration = nil
+        automaticStartupLoadPhase = .idle
         lastRequestedClockConfiguration = nil
     }
 
@@ -3748,6 +4245,7 @@ final class ESP32ControllerViewModel: ObservableObject {
 
         connectedProtocolBoardID = pendingProtocolBoardID
         persistLastConnectedDeviceIfPossible(for: target, boardID: pendingProtocolBoardID)
+        prepareAlarmCacheForConnectedDevice(target: target)
         rememberedDeviceConnectionFailureAlert = nil
         pendingSelectedEndpointDescription = nil
         pendingConnectionDevice = nil
@@ -4366,6 +4864,64 @@ final class ESP32ControllerViewModel: ObservableObject {
         Self.saveLastConnectedDevice(record, to: userDefaults)
     }
 
+    private var alarmCacheIsValidForActiveDevice: Bool {
+        activeAlarmCacheDeviceIdentity != nil &&
+            activeAlarmCacheDeviceIdentity == loadedAlarmCacheDeviceIdentity
+    }
+
+    private func prepareAlarmCacheForConnectedDevice(target: ConnectionTarget) {
+        guard let boardID = connectedProtocolBoardID else {
+            activeAlarmCacheDeviceIdentity = nil
+            return
+        }
+
+        let identity: AlarmCacheDeviceIdentity
+        switch target {
+        case .manual:
+            let host = pendingManualHost ?? self.host
+            let port = pendingManualPort ?? UInt16(self.port) ?? ESP32TCPClient.defaultPort
+            identity = AlarmCacheDeviceIdentity(
+                boardID: boardID,
+                stableEndpoint: "manual|\(host.lowercased()):\(port)"
+            )
+        case .discovered:
+            if let record = lastConnectedDevice, record.boardID == boardID {
+                identity = Self.alarmCacheIdentity(record)
+            } else {
+                identity = AlarmCacheDeviceIdentity(
+                    boardID: boardID,
+                    stableEndpoint: "bonjour|\((connectedEndpointDescription ?? "unknown").lowercased())"
+                )
+            }
+        case let .automaticReconnect(record), let .rememberedDevice(record):
+            identity = Self.alarmCacheIdentity(record)
+        }
+
+        if let alarmRecordsDeviceIdentity, alarmRecordsDeviceIdentity != identity {
+            alarmRecords = AlarmRecord.makeDefaultRecords()
+            selectedAlarmID = nil
+            alarmEditorDraft = nil
+            alarmReadOperationState = .idle
+        }
+        if let loadedAlarmCacheDeviceIdentity, loadedAlarmCacheDeviceIdentity != identity {
+            self.loadedAlarmCacheDeviceIdentity = nil
+        }
+
+        activeAlarmCacheDeviceIdentity = identity
+        alarmRecordsDeviceIdentity = identity
+    }
+
+    private static func alarmCacheIdentity(_ record: LastConnectedDevice) -> AlarmCacheDeviceIdentity {
+        AlarmCacheDeviceIdentity(
+            boardID: record.boardID,
+            stableEndpoint: "\(record.source.rawValue)|\(record.endpointDescription.lowercased())"
+        )
+    }
+
+    private func invalidateAlarmCacheAfterFactoryReset() {
+        loadedAlarmCacheDeviceIdentity = nil
+    }
+
     private static func lastConnectedDevice(from device: DiscoveredESP32, boardID: UInt8) -> LastConnectedDevice {
         let serviceMetadata = ESP32DiscoveryService.serviceEndpointMetadata(from: device.endpoint)
         return LastConnectedDevice(
@@ -4930,6 +5486,36 @@ private extension ConnectionTarget {
 private struct ClockConfiguration: Equatable {
     let is24HourFormat: Bool
     let brightnessLevel: UInt8
+}
+
+private struct PendingClockConfigurationRead: Equatable {
+    let id: UUID
+    let connectionGeneration: UUID
+    let boardID: UInt8
+    let isAutomatic: Bool
+    let timeFormatUserEditRevision: Int
+    let brightnessUserEditRevision: Int
+}
+
+private struct PendingReadDisplayModeOperation: Equatable {
+    let id: UUID
+    let connectionGeneration: UUID
+    let boardID: UInt8
+    let isAutomatic: Bool
+}
+
+private struct AlarmCacheDeviceIdentity: Equatable {
+    let boardID: UInt8
+    let stableEndpoint: String
+}
+
+private enum AutomaticStartupLoadPhase: Equatable {
+    case idle
+    case waitingForPalettes
+    case readingDisplayMode
+    case readingConfiguration
+    case readingAlarms
+    case complete
 }
 
 private struct PendingPaletteOperation: Equatable {

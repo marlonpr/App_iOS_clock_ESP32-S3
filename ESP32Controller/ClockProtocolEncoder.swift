@@ -32,6 +32,8 @@ enum ClockProtocolEncoder {
         switch command {
         case let .setDisplayMode(mode):
             return try SetModeProtocolCodec.makeRequest(boardID: boardID, mode: mode)
+        case .readDisplayMode:
+            return try ReadModeProtocolCodec.makeRequest(boardID: boardID)
         case let .loadPalette(mode):
             return try PaletteProtocolCodec.makeLPRequest(boardID: boardID, mode: mode)
         case let .savePalette(draft):
@@ -78,6 +80,8 @@ enum ClockProtocolEncoder {
             payload = [0x44, 0x4C]
         case .setDisplayMode:
             preconditionFailure("Set Mode commands return through SetModeProtocolCodec.")
+        case .readDisplayMode:
+            preconditionFailure("Read Mode commands return through ReadModeProtocolCodec.")
         case .loadPalette, .savePalette, .restoreDefaultPalette:
             preconditionFailure("Palette commands return through PaletteProtocolCodec.")
         }

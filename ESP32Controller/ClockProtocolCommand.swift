@@ -13,6 +13,7 @@ enum ClockProtocolCommand: Equatable {
     case syncTime(Date)
     case nextDisplayMode
     case setDisplayMode(PaletteMode)
+    case readDisplayMode
     case readConfiguration
     case reset(resetID: UInt8)
     case restoreDefaultLogo
@@ -32,6 +33,8 @@ enum ClockProtocolCommand: Equatable {
             "NM Next Display Mode"
         case let .setDisplayMode(mode):
             "SM Set Display Mode \(mode.rawValue)"
+        case .readDisplayMode:
+            "RM Read Display Mode"
         case .readConfiguration:
             "RC Read Configuration"
         case .reset:
@@ -55,6 +58,8 @@ enum ClockProtocolCommand: Equatable {
             "Display mode command sent"
         case let .setDisplayMode(mode):
             "Display mode \(mode.rawValue) requested"
+        case .readDisplayMode:
+            "Display mode read requested"
         case .restoreDefaultLogo:
             "Default-logo restore command sent"
         case let .loadPalette(mode):
