@@ -1598,7 +1598,11 @@ private func connectedAlarmViewModel(
         heartbeatScheduler: scheduler.schedule(_:_:),
         heartbeatACKTimeoutScheduler: scheduler.schedule(_:_:)
     )
-    let viewModel = ESP32ControllerViewModel(client: client, timeSyncScheduler: scheduler.schedule(_:_:))
+    let viewModel = ESP32ControllerViewModel(
+        client: client,
+        timeSyncScheduler: scheduler.schedule(_:_:),
+        automaticallyReadsPalettesOnConnect: false
+    )
     viewModel.authorizeNetworking()
     viewModel.manualBoardID = "0"
     viewModel.connect()

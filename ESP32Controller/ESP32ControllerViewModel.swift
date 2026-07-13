@@ -50,6 +50,7 @@ final class ESP32ControllerViewModel: ObservableObject {
     @Published private(set) var displayModeChangeState: DisplayModeChangeState = .idle
     @Published private(set) var confirmedDisplayMode: UInt8?
     @Published private(set) var isDisplayModeSuccessAlertPresented = false
+    @Published private(set) var setDisplayModeState: SetDisplayModeState = .idle
     @Published private(set) var defaultLogoRestoreState: DefaultLogoRestoreState = .idle
     @Published private(set) var isDefaultLogoRestoreSuccessAlertPresented = false
     @Published private(set) var logoUploadState: LogoUploadState = .idle
@@ -70,6 +71,14 @@ final class ESP32ControllerViewModel: ObservableObject {
     @Published private(set) var lastCAResultText = "None"
     @Published private(set) var lastDAAlarmID: Int?
     @Published private(set) var lastDAResultText = "None"
+    @Published private(set) var paletteRecords: [PaletteMode: ModePaletteRecord] = [:]
+    @Published private(set) var paletteDrafts: [PaletteMode: ModePaletteDraft] = [:]
+    @Published var selectedPaletteMode: PaletteMode = .mode1
+    @Published private(set) var paletteReadState: PaletteReadState = .idle
+    @Published private(set) var paletteSaveState: PaletteSaveState = .idle
+    @Published private(set) var paletteDefaultRestoreState: PaletteDefaultRestoreState = .idle
+    @Published private(set) var paletteFeatureAvailability: PaletteFeatureAvailability = .unknown
+    @Published private(set) var lastPaletteError: PaletteOperationFailure?
     @Published private(set) var lastConnectedDevice: LastConnectedDevice?
     @Published private(set) var discoveredLogoUploadEndpoints: [DiscoveredLogoUploadEndpoint] = []
     @Published private(set) var appPhaseDiagnosticsText = "Inactive"
@@ -86,8 +95,11 @@ final class ESP32ControllerViewModel: ObservableObject {
     nonisolated static let deviceDefaultConfigurationConfirmationMessage = "This sends only the device default-configuration command to the connected CLOCK. The CLOCK also restores the compiled default logo built into its firmware."
     nonisolated static let timeSyncCompensation: TimeInterval = 1.0
     nonisolated static let timeSyncConfirmationTimeout: TimeInterval = 4
+    nonisolated static let setDisplayModeConfirmationTimeout: TimeInterval = 4
     nonisolated static let defaultLogoRestoreConfirmationTimeout: TimeInterval = 4
     nonisolated static let alarmTransactionTimeout: TimeInterval = 4
+    nonisolated static let paletteTransactionTimeout: TimeInterval = 4
+    nonisolated static let paletteUnsupportedFirmwareMessage = "Color Palette requires newer CLOCK firmware"
     nonisolated static let foregroundHeartbeatValidationTimeout: TimeInterval = 1.75
     nonisolated static let automaticReconnectDelays: [TimeInterval] = [0, 0.5, 1, 2]
     nonisolated static let automaticReconnectDeadline: TimeInterval = 12
@@ -104,6 +116,7 @@ final class ESP32ControllerViewModel: ObservableObject {
     private let logoImageConverter: LogoConversion
     private let logoUploadClient: ESP32LogoUploadClient
     private let userDefaults: UserDefaults
+    private let automaticallyReadsPalettesOnConnect: Bool
     private let maxLogEntries = 200
     nonisolated static let lastConnectedDeviceDefaultsKey = "ESP32Controller.LastConnectedDevice.v1"
     private var pendingConnectionEndpointDescription: String?
@@ -141,6 +154,11 @@ final class ESP32ControllerViewModel: ObservableObject {
     private var pendingDisplayModeOperationID: UUID?
     private var pendingDisplayModeConnectionGeneration: UUID?
     private var displayModeConfirmationTimeoutTask: CancellableTask?
+    private var pendingSetDisplayModeOperationID: UUID?
+    private var pendingSetDisplayModeConnectionGeneration: UUID?
+    private var pendingSetDisplayModeBoardID: UInt8?
+    private var pendingSetDisplayModeTarget: PaletteMode?
+    private var setDisplayModeConfirmationTimeoutTask: CancellableTask?
     private var pendingDefaultLogoRestoreOperationID: UUID?
     private var pendingDefaultLogoRestoreConnectionGeneration: UUID?
     private var pendingDefaultLogoRestoreBoardID: UInt8?
@@ -173,6 +191,10 @@ final class ESP32ControllerViewModel: ObservableObject {
     private var pendingAlarmDeleteBoardID: UInt8?
     private var pendingAlarmDeleteID: Int?
     private var alarmDeleteTimeoutTask: CancellableTask?
+    private var pendingPaletteOperation: PendingPaletteOperation?
+    private var pendingPaletteReadQueue: [PaletteMode] = []
+    private var paletteTransactionTimeoutTask: CancellableTask?
+    private var paletteBootstrapConnectionGeneration: UUID?
     private var cancellables: Set<AnyCancellable> = []
 
     var canConnect: Bool {
@@ -250,6 +272,33 @@ final class ESP32ControllerViewModel: ObservableObject {
             !alarmSendState.isSending &&
             !alarmDeleteState.isDeleting &&
             !alarmReadOperationState.isReading
+    }
+
+    var isPaletteFeatureUnsupported: Bool {
+        if case .unsupported = paletteFeatureAvailability {
+            return true
+        }
+        return false
+    }
+
+    var canSaveSelectedPalette: Bool {
+        canSavePalette(mode: selectedPaletteMode)
+    }
+
+    var isPaletteOperationPending: Bool {
+        paletteReadState.isReading || paletteSaveState.isSaving || paletteDefaultRestoreState.isRestoring
+    }
+
+    var canEditSelectedPalette: Bool {
+        canUseClockControls &&
+            paletteFeatureAvailability.isAvailable &&
+            paletteRecords[selectedPaletteMode] != nil &&
+            paletteDrafts[selectedPaletteMode] != nil &&
+            !isPaletteOperationPending
+    }
+
+    var canRestoreSelectedPaletteDefaults: Bool {
+        canEditSelectedPalette
     }
 
     var alarmReadDiagnosticsText: String {
@@ -456,6 +505,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             try LogoImageConverter().convert(data: data, source: source)
         },
         logoUploadClient: ESP32LogoUploadClient? = nil,
+        automaticallyReadsPalettesOnConnect: Bool = true,
         userDefaults: UserDefaults = .standard
     ) {
         self.client = client ?? ESP32TCPClient()
@@ -466,6 +516,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         self.manualConnectScheduler = manualConnectScheduler
         self.logoImageConverter = logoImageConverter
         self.logoUploadClient = logoUploadClient ?? ESP32LogoUploadClient()
+        self.automaticallyReadsPalettesOnConnect = automaticallyReadsPalettesOnConnect
         self.userDefaults = userDefaults
         self.lastConnectedDevice = Self.loadLastConnectedDevice(from: userDefaults)
 
@@ -483,6 +534,9 @@ final class ESP32ControllerViewModel: ObservableObject {
 
                 self.state = presentationState
                 self.appendEvent(state.title)
+                if presentationState == .connected {
+                    self.startPaletteBootstrapIfNeeded()
+                }
             }
         }
 
@@ -559,6 +613,8 @@ final class ESP32ControllerViewModel: ObservableObject {
         alarmReadTimeoutTask?.cancel()
         alarmWriteTimeoutTask?.cancel()
         alarmDeleteTimeoutTask?.cancel()
+        paletteTransactionTimeoutTask?.cancel()
+        setDisplayModeConfirmationTimeoutTask?.cancel()
     }
 
     func authorizeNetworking() {
@@ -650,6 +706,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
         clearAlarmOperationsForConnectionChange(markInterrupted: true)
+        clearPaletteOperationsForConnectionChange(invalidateRecords: true)
         activeConnectionGeneration = nil
         connectionAttempt = .idle
         isExpectingInitialDisconnect = false
@@ -834,6 +891,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
         clearAlarmOperationsForConnectionChange(markInterrupted: true)
+        clearPaletteOperationsForConnectionChange(invalidateRecords: true)
         activeConnectionGeneration = nil
         connectionAttempt = .explicitDisconnect
         isExpectingInitialDisconnect = false
@@ -1321,6 +1379,92 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
     }
 
+    func userSelectedPaletteMode(_ mode: PaletteMode) {
+        guard mode.isEditable, mode != selectedPaletteMode else {
+            return
+        }
+
+        selectedPaletteMode = mode
+        guard canUseClockControls else {
+            return
+        }
+
+        requestSetDisplayMode(mode)
+    }
+
+    func requestSetDisplayMode(_ mode: PaletteMode) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+        guard canUseClockControls else {
+            setDisplayModeState = .failed(
+                mode: mode,
+                message: "Connect to a CLOCK before changing display mode."
+            )
+            return
+        }
+        guard pendingSetDisplayModeOperationID == nil else {
+            return
+        }
+        guard let boardID = connectedProtocolBoardID else {
+            return
+        }
+
+        let operationID = UUID()
+        let connectionGeneration = activeConnectionGeneration
+
+        do {
+            let command = ClockProtocolCommand.setDisplayMode(mode)
+            let bytes = try ClockProtocolEncoder.encode(command, boardID: boardID)
+            pendingSetDisplayModeOperationID = operationID
+            pendingSetDisplayModeConnectionGeneration = connectionGeneration
+            pendingSetDisplayModeBoardID = boardID
+            pendingSetDisplayModeTarget = mode
+            setDisplayModeState = .sending(mode: mode)
+
+            client.send(Data(bytes)) { [weak self] error in
+                DispatchQueue.main.async {
+                    guard
+                        let self,
+                        self.pendingSetDisplayModeOperationID == operationID,
+                        self.pendingSetDisplayModeConnectionGeneration == connectionGeneration,
+                        self.activeConnectionGeneration == connectionGeneration,
+                        self.pendingSetDisplayModeTarget == mode
+                    else {
+                        return
+                    }
+
+                    if let error {
+                        self.cancelSetDisplayModeConfirmationTimeout()
+                        self.clearPendingSetDisplayModeOperation()
+                        let message = "Unable to send Set Mode command."
+                        self.setDisplayModeState = .failed(mode: mode, message: message)
+                        self.commandStatusMessage = message
+                        self.appendEvent("\(message) \(error.localizedDescription)")
+                    } else {
+                        guard self.setDisplayModeState == .sending(mode: mode) else {
+                            return
+                        }
+
+                        self.setDisplayModeState = .waitingForConfirmation(mode: mode)
+                        self.scheduleSetDisplayModeConfirmationTimeout(
+                            operationID: operationID,
+                            connectionGeneration: connectionGeneration,
+                            mode: mode
+                        )
+                        self.commandStatusMessage = command.sentStatusMessage
+                        self.appendLog(direction: .outgoing, bytes: bytes, message: command.logLabel)
+                    }
+                }
+            }
+        } catch {
+            clearPendingSetDisplayModeOperation()
+            setDisplayModeState = .failed(mode: mode, message: error.localizedDescription)
+            commandStatusMessage = error.localizedDescription
+            appendEvent(error.localizedDescription)
+        }
+    }
+
     func sendCurrentClockConfiguration() {
         guard isNetworkingAuthorized else {
             return
@@ -1597,6 +1741,132 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
     }
 
+    func updatePaletteDraft(_ draft: ModePaletteDraft) {
+        guard draft.mode.isEditable else {
+            return
+        }
+        paletteDrafts[draft.mode] = draft
+    }
+
+    func paletteDraftIsDirty(mode: PaletteMode) -> Bool {
+        guard
+            let record = paletteRecords[mode],
+            let draft = paletteDrafts[mode],
+            let baseline = try? PaletteProtocolCodec.persistedSignature(for: record),
+            let candidate = try? PaletteProtocolCodec.persistedSignature(for: draft)
+        else {
+            return false
+        }
+
+        return baseline != candidate
+    }
+
+    func canSavePalette(mode: PaletteMode) -> Bool {
+        guard
+            canUseClockControls,
+            paletteFeatureAvailability.isAvailable,
+            pendingPaletteOperation == nil,
+            let draft = paletteDrafts[mode],
+            paletteDraftIsDirty(mode: mode),
+            (try? PaletteProtocolCodec.validateCompleteDraft(draft)) != nil
+        else {
+            return false
+        }
+
+        return true
+    }
+
+    func requestPaletteRead(_ mode: PaletteMode) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+        guard mode.isEditable else {
+            failPaletteRead(mode: mode, error: PaletteProtocolError.unsupportedEditableMode)
+            return
+        }
+        guard canUseClockControls else {
+            failPaletteRead(mode: mode, message: "Connect to a CLOCK before reading palettes.")
+            return
+        }
+        guard pendingPaletteOperation == nil else {
+            return
+        }
+
+        pendingPaletteReadQueue = [mode]
+        sendNextPaletteRead()
+    }
+
+    func requestPaletteSave(_ mode: PaletteMode, draft: ModePaletteDraft) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+
+        if draft.mode == mode, mode.isEditable {
+            paletteDrafts[mode] = draft
+        }
+
+        guard draft.mode == mode else {
+            failPaletteSave(mode: mode, message: "Palette draft mode does not match the requested mode.")
+            return
+        }
+        guard mode.isEditable else {
+            failPaletteSave(mode: mode, error: PaletteProtocolError.unsupportedEditableMode)
+            return
+        }
+        guard canUseClockControls else {
+            failPaletteSave(mode: mode, message: "Connect to a CLOCK before saving palettes.")
+            return
+        }
+        guard paletteFeatureAvailability.isAvailable else {
+            failPaletteSave(mode: mode, message: Self.paletteUnsupportedFirmwareMessage)
+            return
+        }
+        guard pendingPaletteOperation == nil else {
+            return
+        }
+        guard paletteDraftIsDirty(mode: mode) else {
+            return
+        }
+
+        do {
+            try PaletteProtocolCodec.validateCompleteDraft(draft)
+            try beginPaletteOperation(kind: .save, mode: mode, draft: draft)
+        } catch {
+            failPaletteSave(mode: mode, error: error)
+        }
+    }
+
+    func requestPaletteSave(_ draft: ModePaletteDraft) {
+        requestPaletteSave(draft.mode, draft: draft)
+    }
+
+    func requestPaletteRestoreDefaults(_ mode: PaletteMode) {
+        guard isNetworkingAuthorized else {
+            return
+        }
+        guard mode.isEditable else {
+            failPaletteDefaultRestore(mode: mode, error: PaletteProtocolError.unsupportedEditableMode)
+            return
+        }
+        guard canUseClockControls else {
+            failPaletteDefaultRestore(mode: mode, message: "Connect to a CLOCK before restoring palette defaults.")
+            return
+        }
+        guard paletteFeatureAvailability.isAvailable else {
+            failPaletteDefaultRestore(mode: mode, message: Self.paletteUnsupportedFirmwareMessage)
+            return
+        }
+        guard pendingPaletteOperation == nil else {
+            return
+        }
+
+        do {
+            try beginPaletteOperation(kind: .restoreDefaults, mode: mode, draft: nil)
+        } catch {
+            failPaletteDefaultRestore(mode: mode, error: error)
+        }
+    }
+
     func requestDeviceReset(resetID: UInt8) {
         guard isNetworkingAuthorized else {
             return
@@ -1612,6 +1882,11 @@ final class ESP32ControllerViewModel: ObservableObject {
             command,
             logLabel: command.logLabel,
             statusMessage: command.sentStatusMessage,
+            onSendSucceeded: { [weak self] in
+                if tracksDeviceDefaultConfiguration {
+                    self?.invalidatePaletteStateAfterFactoryReset()
+                }
+            },
             onSendFinished: { [weak self] in
                 if tracksDeviceDefaultConfiguration {
                     self?.isDeviceDefaultConfigurationSendPending = false
@@ -1956,7 +2231,396 @@ final class ESP32ControllerViewModel: ObservableObject {
         Self.saveLastConnectedDevice(updated, to: userDefaults)
     }
 
+    private func startPaletteBootstrapIfNeeded() {
+        guard
+            automaticallyReadsPalettesOnConnect,
+            state == .connected,
+            let connectionGeneration = activeConnectionGeneration,
+            connectedProtocolBoardID != nil,
+            paletteBootstrapConnectionGeneration != connectionGeneration
+        else {
+            return
+        }
+
+        clearPendingPaletteTransaction()
+        paletteBootstrapConnectionGeneration = connectionGeneration
+        paletteRecords.removeAll()
+        paletteDrafts.removeAll()
+        paletteFeatureAvailability = .unknown
+        paletteReadState = .idle
+        paletteSaveState = .idle
+        paletteDefaultRestoreState = .idle
+        lastPaletteError = nil
+        pendingPaletteReadQueue = PaletteMode.editableCases
+        sendNextPaletteRead()
+    }
+
+    private func sendNextPaletteRead() {
+        guard pendingPaletteOperation == nil else {
+            return
+        }
+        guard !pendingPaletteReadQueue.isEmpty else {
+            return
+        }
+
+        let mode = pendingPaletteReadQueue.removeFirst()
+        do {
+            try beginPaletteOperation(kind: .read, mode: mode, draft: nil)
+        } catch {
+            pendingPaletteReadQueue.removeAll()
+            failPaletteRead(mode: mode, error: error)
+        }
+    }
+
+    private func beginPaletteOperation(
+        kind: PaletteOperationKind,
+        mode: PaletteMode,
+        draft: ModePaletteDraft?
+    ) throws {
+        guard
+            pendingPaletteOperation == nil,
+            state == .connected,
+            let connectionGeneration = activeConnectionGeneration,
+            let boardID = connectedProtocolBoardID
+        else {
+            throw PaletteViewModelTransactionError.notConnected
+        }
+
+        let command: ClockProtocolCommand
+        switch kind {
+        case .read:
+            command = .loadPalette(mode)
+        case .save:
+            guard let draft else {
+                throw PaletteViewModelTransactionError.missingDraft
+            }
+            command = .savePalette(draft)
+        case .restoreDefaults:
+            command = .restoreDefaultPalette(mode)
+        }
+
+        let bytes = try ClockProtocolEncoder.encode(command, boardID: boardID)
+        let operation = PendingPaletteOperation(
+            id: UUID(),
+            connectionGeneration: connectionGeneration,
+            boardID: boardID,
+            kind: kind,
+            mode: mode,
+            draft: draft
+        )
+        pendingPaletteOperation = operation
+        lastPaletteError = nil
+
+        switch kind {
+        case .read:
+            paletteReadState = .reading(mode: mode)
+        case .save:
+            paletteSaveState = .saving(mode: mode)
+        case .restoreDefaults:
+            paletteDefaultRestoreState = .restoring(mode: mode)
+        }
+
+        client.send(Data(bytes)) { [weak self] error in
+            DispatchQueue.main.async {
+                guard
+                    let self,
+                    self.isCurrentPaletteOperation(operation)
+                else {
+                    return
+                }
+
+                if let error {
+                    self.handlePaletteTransportFailure(
+                        operation,
+                        message: "Unable to send palette \(operation.kind.rawValue) request: \(error.localizedDescription)",
+                        markUnsupported: false
+                    )
+                } else {
+                    self.appendLog(direction: .outgoing, bytes: bytes, message: command.logLabel)
+                    self.schedulePaletteTimeout(for: operation)
+                }
+            }
+        }
+    }
+
+    private func consumePaletteResponseIfExpected(_ bytes: [UInt8]) -> Bool {
+        guard
+            let operation = pendingPaletteOperation,
+            isCurrentPaletteOperation(operation),
+            isPaletteResponseCandidate(bytes, boardID: operation.boardID, kind: operation.kind)
+        else {
+            return false
+        }
+
+        do {
+            switch operation.kind {
+            case .read:
+                let response = try PaletteProtocolCodec.decodeLPResponse(bytes, expectedBoardID: operation.boardID)
+                switch response {
+                case let .success(record):
+                    guard record.mode == operation.mode else {
+                        return false
+                    }
+                    finishPendingPaletteOperation(operation)
+                    paletteRecords[record.mode] = record
+                    paletteDrafts[record.mode] = record.draft
+                    paletteFeatureAvailability = .available
+                    paletteReadState = .succeeded(mode: record.mode)
+                    appendLog(
+                        direction: .incoming,
+                        bytes: bytes,
+                        message: "LP Palette Mode \(record.mode.rawValue) Loaded"
+                    )
+                    sendNextPaletteRead()
+                case let .failure(mode, status):
+                    guard mode == operation.mode else {
+                        return false
+                    }
+                    finishPendingPaletteOperation(operation)
+                    failPaletteRead(mode: mode, status: status)
+                    appendLog(
+                        direction: .incoming,
+                        bytes: bytes,
+                        message: "LP Palette Mode \(mode.rawValue) Status \(status.uppercaseHex)"
+                    )
+                    if status.indicatesUnsupportedFirmware {
+                        pendingPaletteReadQueue.removeAll()
+                        markPaletteFeatureUnsupported()
+                    } else {
+                        sendNextPaletteRead()
+                    }
+                }
+            case .save:
+                let acknowledgement = try PaletteProtocolCodec.decodeCPACK(bytes, expectedBoardID: operation.boardID)
+                guard acknowledgement.mode == operation.mode else {
+                    return false
+                }
+                finishPendingPaletteOperation(operation)
+                appendLog(
+                    direction: .incoming,
+                    bytes: bytes,
+                    message: "CP Palette Mode \(operation.mode.rawValue) Status \(acknowledgement.status.uppercaseHex)"
+                )
+                if acknowledgement.status.isSuccess {
+                    paletteSaveState = .succeeded(mode: operation.mode)
+                    lastPaletteError = nil
+                    requestPaletteRead(operation.mode)
+                } else {
+                    failPaletteSave(mode: operation.mode, status: acknowledgement.status)
+                    if acknowledgement.status.indicatesUnsupportedFirmware {
+                        markPaletteFeatureUnsupported()
+                    }
+                }
+            case .restoreDefaults:
+                let acknowledgement = try PaletteProtocolCodec.decodeDPACK(bytes, expectedBoardID: operation.boardID)
+                guard acknowledgement.mode == operation.mode else {
+                    return false
+                }
+                finishPendingPaletteOperation(operation)
+                appendLog(
+                    direction: .incoming,
+                    bytes: bytes,
+                    message: "DP Palette Mode \(operation.mode.rawValue) Status \(acknowledgement.status.uppercaseHex)"
+                )
+                if acknowledgement.status.isSuccess {
+                    paletteDefaultRestoreState = .succeeded(mode: operation.mode)
+                    lastPaletteError = nil
+                    requestPaletteRead(operation.mode)
+                } else {
+                    failPaletteDefaultRestore(mode: operation.mode, status: acknowledgement.status)
+                    if acknowledgement.status.indicatesUnsupportedFirmware {
+                        markPaletteFeatureUnsupported()
+                    }
+                }
+            }
+        } catch {
+            handlePaletteTransportFailure(
+                operation,
+                message: error.localizedDescription,
+                markUnsupported: true
+            )
+            appendLog(
+                direction: .incoming,
+                bytes: bytes,
+                message: "Malformed \(operation.kind.rawValue) palette response"
+            )
+        }
+
+        return true
+    }
+
+    private func schedulePaletteTimeout(for operation: PendingPaletteOperation) {
+        cancelPaletteTransactionTimeout()
+        paletteTransactionTimeoutTask = timeSyncScheduler(Self.paletteTransactionTimeout) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard
+                    let self,
+                    self.isCurrentPaletteOperation(operation)
+                else {
+                    return
+                }
+
+                self.paletteTransactionTimeoutTask = nil
+                self.handlePaletteTransportFailure(
+                    operation,
+                    message: "Palette \(operation.kind.rawValue) timed out.",
+                    markUnsupported: true
+                )
+            }
+        }
+    }
+
+    private func handlePaletteTransportFailure(
+        _ operation: PendingPaletteOperation,
+        message: String,
+        markUnsupported: Bool
+    ) {
+        finishPendingPaletteOperation(operation)
+        pendingPaletteReadQueue.removeAll()
+        switch operation.kind {
+        case .read:
+            failPaletteRead(mode: operation.mode, message: message)
+        case .save:
+            failPaletteSave(mode: operation.mode, message: message)
+        case .restoreDefaults:
+            failPaletteDefaultRestore(mode: operation.mode, message: message)
+        }
+        if markUnsupported {
+            markPaletteFeatureUnsupported()
+        }
+    }
+
+    private func isCurrentPaletteOperation(_ operation: PendingPaletteOperation) -> Bool {
+        pendingPaletteOperation?.id == operation.id &&
+            pendingPaletteOperation?.connectionGeneration == operation.connectionGeneration &&
+            activeConnectionGeneration == operation.connectionGeneration &&
+            connectedProtocolBoardID == operation.boardID &&
+            state == .connected
+    }
+
+    private func isPaletteResponseCandidate(
+        _ bytes: [UInt8],
+        boardID: UInt8,
+        kind: PaletteOperationKind
+    ) -> Bool {
+        guard
+            bytes.count >= 6,
+            bytes[0] == 0x2F,
+            bytes[1] == 0x74,
+            bytes[2] == 0x61,
+            bytes[3] == boardID
+        else {
+            return false
+        }
+
+        let command: [UInt8]
+        switch kind {
+        case .read:
+            command = [0x6C, 0x70]
+        case .save:
+            command = [0x63, 0x70]
+        case .restoreDefaults:
+            command = [0x64, 0x70]
+        }
+        return bytes[4] == command[0] && bytes[5] == command[1]
+    }
+
+    private func finishPendingPaletteOperation(_ operation: PendingPaletteOperation) {
+        guard pendingPaletteOperation?.id == operation.id else {
+            return
+        }
+        cancelPaletteTransactionTimeout()
+        pendingPaletteOperation = nil
+    }
+
+    private func clearPendingPaletteTransaction() {
+        cancelPaletteTransactionTimeout()
+        pendingPaletteOperation = nil
+        pendingPaletteReadQueue.removeAll()
+    }
+
+    private func cancelPaletteTransactionTimeout() {
+        paletteTransactionTimeoutTask?.cancel()
+        paletteTransactionTimeoutTask = nil
+    }
+
+    private func failPaletteRead(mode: PaletteMode?, status: PaletteStatus? = nil, message: String? = nil) {
+        let message = message ?? status?.message ?? "Palette read failed."
+        paletteReadState = .failed(mode: mode, message: message)
+        lastPaletteError = PaletteOperationFailure(operation: .read, mode: mode, status: status, message: message)
+    }
+
+    private func failPaletteRead(mode: PaletteMode?, error: Error) {
+        failPaletteRead(mode: mode, message: error.localizedDescription)
+    }
+
+    private func failPaletteSave(mode: PaletteMode, status: PaletteStatus? = nil, message: String? = nil) {
+        let message = message ?? status?.message ?? "Palette save failed."
+        paletteSaveState = .failed(mode: mode, message: message)
+        lastPaletteError = PaletteOperationFailure(operation: .save, mode: mode, status: status, message: message)
+    }
+
+    private func failPaletteSave(mode: PaletteMode, error: Error) {
+        failPaletteSave(mode: mode, message: error.localizedDescription)
+    }
+
+    private func failPaletteDefaultRestore(
+        mode: PaletteMode,
+        status: PaletteStatus? = nil,
+        message: String? = nil
+    ) {
+        let message = message ?? status?.message ?? "Palette default restore failed."
+        paletteDefaultRestoreState = .failed(mode: mode, message: message)
+        lastPaletteError = PaletteOperationFailure(
+            operation: .restoreDefaults,
+            mode: mode,
+            status: status,
+            message: message
+        )
+    }
+
+    private func failPaletteDefaultRestore(mode: PaletteMode, error: Error) {
+        failPaletteDefaultRestore(mode: mode, message: error.localizedDescription)
+    }
+
+    private func markPaletteFeatureUnsupported() {
+        paletteFeatureAvailability = .unsupported(Self.paletteUnsupportedFirmwareMessage)
+    }
+
+    private func invalidatePaletteStateAfterFactoryReset() {
+        clearPendingPaletteTransaction()
+        paletteRecords.removeAll()
+        paletteDrafts.removeAll()
+        paletteFeatureAvailability = .unknown
+        paletteReadState = .idle
+        paletteSaveState = .idle
+        paletteDefaultRestoreState = .idle
+        lastPaletteError = nil
+    }
+
+    private func clearPaletteOperationsForConnectionChange(invalidateRecords: Bool) {
+        clearPendingPaletteTransaction()
+        paletteBootstrapConnectionGeneration = nil
+        paletteReadState = .idle
+        paletteSaveState = .idle
+        paletteDefaultRestoreState = .idle
+        lastPaletteError = nil
+        if invalidateRecords {
+            paletteRecords.removeAll()
+            paletteDrafts.removeAll()
+            paletteFeatureAvailability = .unknown
+        }
+    }
+
     private func handleReceivedFrame(_ bytes: [UInt8]) {
+        if consumePaletteResponseIfExpected(bytes) {
+            return
+        }
+
+        if consumeSetDisplayModeResponseIfExpected(bytes) {
+            return
+        }
+
         if consumeTimeSyncACKIfExpected(bytes) {
             return
         }
@@ -2047,6 +2711,74 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         return bytes[6]
+    }
+
+    private func consumeSetDisplayModeResponseIfExpected(_ bytes: [UInt8]) -> Bool {
+        guard
+            let operationID = pendingSetDisplayModeOperationID,
+            pendingSetDisplayModeConnectionGeneration == activeConnectionGeneration,
+            let boardID = pendingSetDisplayModeBoardID,
+            let target = pendingSetDisplayModeTarget,
+            isSetDisplayModeResponseCandidate(bytes, boardID: boardID)
+        else {
+            return false
+        }
+
+        let acknowledgement: SetModeAcknowledgement
+        do {
+            acknowledgement = try SetModeProtocolCodec.decodeResponse(bytes, expectedBoardID: boardID)
+        } catch {
+            cancelSetDisplayModeConfirmationTimeout()
+            clearPendingSetDisplayModeOperation()
+            let message = "Could not change display mode. \(error.localizedDescription)"
+            setDisplayModeState = .failed(mode: target, message: message)
+            commandStatusMessage = message
+            appendLog(direction: .incoming, bytes: bytes, message: "SM Set Display Mode Invalid Response")
+            return true
+        }
+
+        guard pendingSetDisplayModeOperationID == operationID else {
+            return true
+        }
+
+        cancelSetDisplayModeConfirmationTimeout()
+        clearPendingSetDisplayModeOperation()
+
+        guard acknowledgement.modeValue == target.rawValue else {
+            let message = "Could not change display mode. The CLOCK confirmed a different mode."
+            setDisplayModeState = .failed(mode: target, message: message)
+            commandStatusMessage = message
+            appendLog(direction: .incoming, bytes: bytes, message: "SM Set Display Mode Mismatched Response")
+            return true
+        }
+
+        guard acknowledgement.status == .success else {
+            let message = "Could not change display mode. \(acknowledgement.status.message)"
+            setDisplayModeState = .failed(mode: target, message: message)
+            commandStatusMessage = message
+            appendLog(
+                direction: .incoming,
+                bytes: bytes,
+                message: "SM Set Display Mode Failed \(acknowledgement.status.uppercaseHex)"
+            )
+            return true
+        }
+
+        confirmedDisplayMode = target.rawValue
+        setDisplayModeState = .succeeded(mode: target)
+        commandStatusMessage = "Display mode changed to Mode \(target.rawValue)"
+        appendLog(direction: .incoming, bytes: bytes, message: "SM Set Display Mode Confirmed")
+        return true
+    }
+
+    private func isSetDisplayModeResponseCandidate(_ bytes: [UInt8], boardID: UInt8) -> Bool {
+        bytes.count >= 6 &&
+            bytes[0] == 0x2F &&
+            bytes[1] == 0x74 &&
+            bytes[2] == 0x61 &&
+            bytes[3] == boardID &&
+            bytes[4] == 0x73 &&
+            bytes[5] == 0x6D
     }
 
     private func consumeDefaultLogoRestoreResponseIfExpected(_ bytes: [UInt8]) -> Bool {
@@ -2173,6 +2905,53 @@ final class ESP32ControllerViewModel: ObservableObject {
     private func cancelDisplayModeTasks() {
         displayModeConfirmationTimeoutTask?.cancel()
         displayModeConfirmationTimeoutTask = nil
+    }
+
+    private func scheduleSetDisplayModeConfirmationTimeout(
+        operationID: UUID,
+        connectionGeneration: UUID?,
+        mode: PaletteMode
+    ) {
+        cancelSetDisplayModeConfirmationTimeout()
+        setDisplayModeConfirmationTimeoutTask = timeSyncScheduler(Self.setDisplayModeConfirmationTimeout) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard
+                    let self,
+                    self.pendingSetDisplayModeOperationID == operationID,
+                    self.pendingSetDisplayModeConnectionGeneration == connectionGeneration,
+                    self.activeConnectionGeneration == connectionGeneration,
+                    self.pendingSetDisplayModeTarget == mode,
+                    self.setDisplayModeState == .waitingForConfirmation(mode: mode)
+                else {
+                    return
+                }
+
+                self.setDisplayModeConfirmationTimeoutTask = nil
+                self.clearPendingSetDisplayModeOperation()
+                let message = "Display mode change not confirmed."
+                self.setDisplayModeState = .failed(mode: mode, message: message)
+                self.commandStatusMessage = message
+                self.appendEvent(message)
+            }
+        }
+    }
+
+    private func cancelSetDisplayModeConfirmationTimeout() {
+        setDisplayModeConfirmationTimeoutTask?.cancel()
+        setDisplayModeConfirmationTimeoutTask = nil
+    }
+
+    private func clearPendingSetDisplayModeOperation() {
+        pendingSetDisplayModeOperationID = nil
+        pendingSetDisplayModeConnectionGeneration = nil
+        pendingSetDisplayModeBoardID = nil
+        pendingSetDisplayModeTarget = nil
+    }
+
+    private func clearSetDisplayModeStateForConnectionChange() {
+        cancelSetDisplayModeConfirmationTimeout()
+        clearPendingSetDisplayModeOperation()
+        setDisplayModeState = .idle
     }
 
     private func scheduleDefaultLogoRestoreConfirmationTimeout(operationID: UUID, connectionGeneration: UUID?) {
@@ -2740,6 +3519,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         isDisplayModeSuccessAlertPresented = false
         confirmedDisplayMode = nil
         displayModeChangeState = .idle
+        clearSetDisplayModeStateForConnectionChange()
     }
 
     private func clearDefaultLogoRestoreStateForConnectionChange() {
@@ -2780,6 +3560,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
         clearAlarmOperationsForConnectionChange(markInterrupted: true)
+        clearPaletteOperationsForConnectionChange(invalidateRecords: true)
         activeConnectionGeneration = nil
         connectionAttempt = .explicitDisconnect
         isExpectingInitialDisconnect = false
@@ -2806,6 +3587,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
         clearAlarmOperationsForConnectionChange(markInterrupted: true)
+        clearPaletteOperationsForConnectionChange(invalidateRecords: true)
         activeConnectionGeneration = UUID()
         connectionAttempt = .starting(target)
         isExpectingInitialDisconnect = true
@@ -2856,6 +3638,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             clearLogoUploadStateForConnectionChange()
             clearClockConfigurationCacheForConnectionChange()
             clearAlarmOperationsForConnectionChange(markInterrupted: true)
+            clearPaletteOperationsForConnectionChange(invalidateRecords: true)
             activeConnectionGeneration = nil
             isExpectingInitialDisconnect = false
             connectionAttempt = .idle
@@ -2903,6 +3686,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             clearLogoUploadStateForConnectionChange()
             clearClockConfigurationCacheForConnectionChange()
             clearAlarmOperationsForConnectionChange(markInterrupted: true)
+            clearPaletteOperationsForConnectionChange(invalidateRecords: true)
             activeConnectionGeneration = nil
             connectionAttempt = .idle
             pendingConnectionEndpointDescription = nil
@@ -3126,6 +3910,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
         clearAlarmOperationsForConnectionChange(markInterrupted: true)
+        clearPaletteOperationsForConnectionChange(invalidateRecords: true)
         activeConnectionGeneration = nil
         connectionAttempt = .idle
         isExpectingInitialDisconnect = false
@@ -3373,6 +4158,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         clearLogoUploadStateForConnectionChange()
         clearClockConfigurationCacheForConnectionChange()
         clearAlarmOperationsForConnectionChange(markInterrupted: true)
+        clearPaletteOperationsForConnectionChange(invalidateRecords: true)
         activeConnectionGeneration = nil
         connectionAttempt = .idle
         isExpectingInitialDisconnect = false
@@ -3769,6 +4555,39 @@ enum DisplayModeChangeState: Equatable {
     }
 }
 
+enum SetDisplayModeState: Equatable {
+    case idle
+    case sending(mode: PaletteMode)
+    case waitingForConfirmation(mode: PaletteMode)
+    case succeeded(mode: PaletteMode)
+    case failed(mode: PaletteMode, message: String)
+
+    var isPending: Bool {
+        switch self {
+        case .sending, .waitingForConfirmation:
+            true
+        case .idle, .succeeded, .failed:
+            false
+        }
+    }
+
+    var pendingMode: PaletteMode? {
+        switch self {
+        case let .sending(mode), let .waitingForConfirmation(mode):
+            mode
+        case .idle, .succeeded, .failed:
+            nil
+        }
+    }
+
+    var errorMessage: String? {
+        guard case let .failed(_, message) = self else {
+            return nil
+        }
+        return message
+    }
+}
+
 enum DefaultLogoRestoreState: Equatable {
     case idle
     case sending
@@ -4111,6 +4930,29 @@ private extension ConnectionTarget {
 private struct ClockConfiguration: Equatable {
     let is24HourFormat: Bool
     let brightnessLevel: UInt8
+}
+
+private struct PendingPaletteOperation: Equatable {
+    let id: UUID
+    let connectionGeneration: UUID
+    let boardID: UInt8
+    let kind: PaletteOperationKind
+    let mode: PaletteMode
+    let draft: ModePaletteDraft?
+}
+
+private enum PaletteViewModelTransactionError: LocalizedError {
+    case notConnected
+    case missingDraft
+
+    var errorDescription: String? {
+        switch self {
+        case .notConnected:
+            "Connect to a CLOCK before starting a palette operation."
+        case .missingDraft:
+            "A complete palette draft is required for save."
+        }
+    }
 }
 
 private enum ClockConfigurationChangeReason {

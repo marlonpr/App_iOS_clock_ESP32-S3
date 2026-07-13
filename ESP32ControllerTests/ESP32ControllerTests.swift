@@ -5883,7 +5883,8 @@ struct ESP32ControllerTests {
             discoveryService: ESP32DiscoveryService(
                 browserFactory: { FakeESP32Browser() },
                 logoBrowserFactory: { FakeESP32Browser() }
-            )
+            ),
+            automaticallyReadsPalettesOnConnect: false
         )
         viewModel.authorizeNetworking()
         let device = makeDevice(id: "service-decimal", serviceName: "ESP32 Decimal", boardID: "10")
@@ -6519,7 +6520,8 @@ struct ESP32ControllerTests {
             discoveryService: ESP32DiscoveryService(
                 browserFactory: { FakeESP32Browser() },
                 logoBrowserFactory: { FakeESP32Browser() }
-            )
+            ),
+            automaticallyReadsPalettesOnConnect: false
         )
         viewModel.authorizeNetworking()
         let validDevice = makeDevice(id: "service-valid", serviceName: "ESP32 Valid", boardID: "7")
@@ -7681,6 +7683,7 @@ private func makeViewModelForManualHeartbeatTests(
             logoBrowserFactory: { FakeESP32Browser() }
         ),
         reconnectScheduler: reconnectScheduler,
+        automaticallyReadsPalettesOnConnect: false,
         userDefaults: userDefaults
     )
     viewModel.authorizeNetworking()
@@ -8398,6 +8401,7 @@ private func makeViewModelForConnectionIndicatorTests(
         timeSyncScheduler: timeSyncScheduler,
         reconnectScheduler: reconnectScheduler,
         manualConnectScheduler: manualConnectScheduler,
+        automaticallyReadsPalettesOnConnect: false,
         userDefaults: userDefaults
     )
     viewModel.authorizeNetworking()
@@ -8438,6 +8442,7 @@ private func makeViewModelForLogoTests(
         reconnectScheduler: reconnectScheduler,
         logoImageConverter: logoImageConverter,
         logoUploadClient: logoUploadClient ?? ESP32LogoUploadClient(),
+        automaticallyReadsPalettesOnConnect: false,
         userDefaults: userDefaults
     )
     viewModel.authorizeNetworking()

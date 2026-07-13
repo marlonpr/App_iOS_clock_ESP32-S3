@@ -29,6 +29,19 @@ enum ClockProtocolEncoder {
             throw ClockProtocolEncodingError.reservedBoardID
         }
 
+        switch command {
+        case let .setDisplayMode(mode):
+            return try SetModeProtocolCodec.makeRequest(boardID: boardID, mode: mode)
+        case let .loadPalette(mode):
+            return try PaletteProtocolCodec.makeLPRequest(boardID: boardID, mode: mode)
+        case let .savePalette(draft):
+            return try PaletteProtocolCodec.makeCPRequest(boardID: boardID, draft: draft)
+        case let .restoreDefaultPalette(mode):
+            return try PaletteProtocolCodec.makeDPRequest(boardID: boardID, mode: mode)
+        default:
+            break
+        }
+
         let payload: [UInt8]
         switch command {
         case .connectionTest:
@@ -63,6 +76,10 @@ enum ClockProtocolEncoder {
             payload = [0x52, 0x54, resetID]
         case .restoreDefaultLogo:
             payload = [0x44, 0x4C]
+        case .setDisplayMode:
+            preconditionFailure("Set Mode commands return through SetModeProtocolCodec.")
+        case .loadPalette, .savePalette, .restoreDefaultPalette:
+            preconditionFailure("Palette commands return through PaletteProtocolCodec.")
         }
 
         for byte in payload where byte == frameTerminator {

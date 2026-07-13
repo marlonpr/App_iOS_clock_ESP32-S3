@@ -262,6 +262,7 @@ struct ContentView: View {
             Form {
                 esp32DevicesSection
                 clockControlsSection
+                ColorPaletteSection(viewModel: viewModel)
                 alarmSection
                 logoSection
                 bottomActionsSection
