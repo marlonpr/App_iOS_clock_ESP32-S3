@@ -182,17 +182,23 @@ struct ContentView: View {
             )
             .disabled(!viewModel.canToggleShowAllDisplayModes)
 
-            Picker("Time Format", selection: Binding(
-                get: { viewModel.is24HourFormat },
-                set: { newValue in
-                    dismissKeyboard()
-                    viewModel.userSelectedTimeFormat(newValue)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Format")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker("Time Format", selection: Binding(
+                    get: { viewModel.is24HourFormat },
+                    set: { newValue in
+                        dismissKeyboard()
+                        viewModel.userSelectedTimeFormat(newValue)
+                    }
+                )) {
+                    Text("12 Hour").tag(false)
+                    Text("24 Hour").tag(true)
                 }
-            )) {
-                Text("12 Hour").tag(false)
-                Text("24 Hour").tag(true)
+                .pickerStyle(.segmented)
             }
-            .pickerStyle(.segmented)
             .disabled(!viewModel.canUseClockControls)
 
             VStack(alignment: .leading, spacing: 8) {
@@ -620,6 +626,10 @@ private struct ControllerNavigationTitle: View {
     }
 }
 
+enum LogoPreviewPresentation {
+    static let placeholderText = "LOGO"
+}
+
 private struct LogoPreviewView: View {
     let previewImage: CGImage?
 
@@ -632,6 +642,10 @@ private struct LogoPreviewView: View {
                     .interpolation(.none)
                     .resizable()
                     .aspectRatio(2, contentMode: .fit)
+            } else {
+                Text(LogoPreviewPresentation.placeholderText)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.white)
             }
         }
         .aspectRatio(2, contentMode: .fit)

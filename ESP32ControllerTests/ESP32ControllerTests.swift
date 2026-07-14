@@ -3539,6 +3539,12 @@ struct ESP32ControllerTests {
         #expect(viewModel.convertedLogoPayload == payload)
         #expect(viewModel.processedLogoPreview != nil)
         #expect(controlRecorder.connections[0].cancelCallCount >= 1)
+
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+
+        #expect(viewModel.convertedLogoPayload == payload)
+        #expect(viewModel.processedLogoPreview != nil)
     }
 
     @MainActor
@@ -6719,6 +6725,45 @@ struct ESP32ControllerTests {
 
         #expect(health.last == .healthy)
         #expect(connections[1].cancelCallCount == 0)
+    }
+
+    @MainActor
+    @Test func emptyLogoPreviewUsesVisualPlaceholderWithoutCreatingUploadState() async throws {
+        let controlRecorder = FakeTCPConnectionRecorder()
+        let logoRecorder = FakeTCPConnectionRecorder()
+        let logoClient = ESP32LogoUploadClient(connectionFactory: { _ in logoRecorder.makeConnection() })
+        let viewModel = makeViewModelForLogoTests(
+            recorder: controlRecorder,
+            logoImageConverter: { _, _ in try makeLogoConversionResult(payload: makeLogoPayload()) },
+            logoUploadClient: logoClient,
+            userDefaults: makeIsolatedUserDefaults()
+        )
+        viewModel.manualBoardID = "0"
+        viewModel.connect()
+        await drainMainQueue()
+        controlRecorder.connections[0].stateUpdateHandler?(.ready)
+        await drainMainQueue()
+
+        #expect(LogoPreviewPresentation.placeholderText == "LOGO")
+        #expect(viewModel.processedLogoPreview == nil)
+        #expect(viewModel.convertedLogoPayload == nil)
+        #expect(viewModel.logoSourceDiagnostics == nil)
+        #expect(viewModel.logoUploadState == .idle)
+        #expect(!viewModel.canUploadLogo)
+
+        viewModel.handleAppEnteredBackground()
+        await drainMainQueue()
+        viewModel.handleAppBecameActive()
+        await drainMainQueue()
+
+        #expect(viewModel.processedLogoPreview == nil)
+        #expect(viewModel.convertedLogoPayload == nil)
+        #expect(!viewModel.canUploadLogo)
+
+        viewModel.uploadLogo()
+        #expect(logoRecorder.connections.isEmpty)
+        #expect(viewModel.processedLogoPreview == nil)
+        #expect(viewModel.convertedLogoPayload == nil)
     }
 
     @Test func logoFileHeaderAndCRCMatchFirmwareContract() throws {
