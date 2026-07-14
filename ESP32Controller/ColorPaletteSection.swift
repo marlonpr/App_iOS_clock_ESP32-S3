@@ -12,6 +12,7 @@ enum ColorPalettePresentation {
     static let disconnectedMessage = "Connect to a CLOCK device to edit colors."
     static let unsupportedMessage = "Color Palette requires newer CLOCK firmware."
     static let loadingMessage = "Loading colors..."
+    static let showAllModesMessage = "Turn off Show all modes to edit colors."
 
     static func modeTitle(_ mode: PaletteMode) -> String {
         "Mode \(mode.rawValue)"
@@ -161,7 +162,15 @@ struct ColorPaletteSection: View {
                 }
             }
             .pickerStyle(.segmented)
-            .disabled(viewModel.isPaletteOperationPending)
+            .disabled(!viewModel.canSelectPaletteMode)
+
+            if viewModel.isPaletteEditingLockedByShowAllModes {
+                ColorPaletteStatusRow(
+                    message: ColorPalettePresentation.showAllModesMessage,
+                    showsProgress: false,
+                    isError: false
+                )
+            }
 
             switch contentState {
             case .ready:

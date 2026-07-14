@@ -620,7 +620,7 @@ struct PaletteTests {
     }
 
     @MainActor
-    @Test func pendingSMKeepsLatestLocalSelectionWithoutQueueingAnotherCommand() async throws {
+    @Test func pendingSMDoesNotQueueAndSuccessResynchronizesSelection() async throws {
         let context = try await loadedPaletteContext()
         let startingCount = context.connection.sentFrames.count
 
@@ -632,7 +632,7 @@ struct PaletteTests {
         #expect(context.viewModel.setDisplayModeState == .sending(mode: .mode2))
 
         await context.receive(responseFrame(command: "sm", payload: "0200"))
-        #expect(context.viewModel.selectedPaletteMode == .mode3)
+        #expect(context.viewModel.selectedPaletteMode == .mode2)
         #expect(context.viewModel.confirmedDisplayMode == PaletteMode.mode2.rawValue)
     }
 
@@ -743,6 +743,330 @@ struct PaletteTests {
         #expect(context.viewModel.confirmedDisplayMode == 4)
         #expect(context.viewModel.selectedPaletteMode == .mode2)
         #expect(context.connection.sentFrames.allSatisfy { frameCommand($0) != "SM" })
+    }
+
+    @MainActor
+    @Test func directDisplayModeButtonsSendExactSMOnlyAndSuppressActiveModeDuplicates() async throws {
+        let context = try await loadedPaletteContext()
+        context.viewModel.requestCurrentDisplayMode()
+        await context.receive(responseFrame(command: "rm", payload: "0100"))
+        let startingCount = context.connection.sentFrames.count
+
+        context.viewModel.userSelectedDisplayMode(.mode1)
+        #expect(context.connection.sentFrames.count == startingCount)
+
+        for target in [PaletteMode.mode2, .mode3, .mode1] {
+            context.viewModel.userSelectedDisplayMode(target)
+            #expect(context.connection.sentFrames.last == requestFrame("SM\(target.uppercaseHex)"))
+
+            await context.receive(responseFrame(command: "sm", payload: "\(target.uppercaseHex)00"))
+            #expect(context.viewModel.confirmedDisplayMode == target.rawValue)
+            #expect(context.viewModel.lastNormalDisplayMode == target)
+            #expect(context.viewModel.selectedPaletteMode == target)
+            #expect(!context.viewModel.isShowingAllDisplayModes)
+
+            let confirmedCount = context.connection.sentFrames.count
+            context.viewModel.userSelectedDisplayMode(target)
+            #expect(context.connection.sentFrames.count == confirmedCount)
+        }
+
+        let buttonFrames = Array(context.connection.sentFrames.dropFirst(startingCount))
+        #expect(buttonFrames == [requestFrame("SM02"), requestFrame("SM03"), requestFrame("SM01")])
+        #expect(buttonFrames.map(frameCommand) == ["SM", "SM", "SM"])
+        #expect(buttonFrames.allSatisfy {
+            !["NM", "LP", "CP", "DP", "CT", "CA", "DA", "RC"].contains(frameCommand($0))
+        })
+    }
+
+    @MainActor
+    @Test func pendingDirectDisplayModeDisablesControlsAndDoesNotQueueAnotherSM() async throws {
+        let context = try await loadedPaletteContext()
+        let startingCount = context.connection.sentFrames.count
+
+        context.viewModel.userSelectedDisplayMode(.mode2)
+        #expect(!context.viewModel.canSelectDisplayMode)
+        #expect(!context.viewModel.canToggleShowAllDisplayModes)
+
+        context.viewModel.userSelectedDisplayMode(.mode3)
+        context.viewModel.userSetShowAllDisplayModes(true)
+        #expect(Array(context.connection.sentFrames.dropFirst(startingCount)) == [requestFrame("SM02")])
+
+        await context.receive(responseFrame(command: "sm", payload: "0200"))
+        #expect(context.viewModel.canSelectDisplayMode)
+        #expect(context.viewModel.canToggleShowAllDisplayModes)
+    }
+
+    @MainActor
+    @Test func showAllModesEntersFourAndReturnsToLastNormalMode() async throws {
+        let context = try await loadedPaletteContext()
+        context.viewModel.requestCurrentDisplayMode()
+        await context.receive(responseFrame(command: "rm", payload: "0200"))
+        #expect(context.viewModel.lastNormalDisplayMode == .mode2)
+
+        let enterStart = context.connection.sentFrames.count
+        context.viewModel.userSetShowAllDisplayModes(true)
+        #expect(context.viewModel.isShowingAllDisplayModes)
+        #expect(context.connection.sentFrames.last == requestFrame("SM04"))
+        context.viewModel.userSetShowAllDisplayModes(false)
+        #expect(context.connection.sentFrames.count == enterStart + 1)
+
+        await context.receive(responseFrame(command: "sm", payload: "0400"))
+        #expect(context.viewModel.confirmedDisplayMode == 4)
+        #expect(context.viewModel.lastNormalDisplayMode == .mode2)
+        #expect(context.viewModel.selectedPaletteMode == .mode2)
+        #expect(context.viewModel.isShowingAllDisplayModes)
+        #expect(context.viewModel.highlightedDisplayModes == Set(PaletteMode.editableCases))
+        #expect(context.viewModel.canSelectDisplayMode)
+
+        context.viewModel.userSetShowAllDisplayModes(false)
+        #expect(!context.viewModel.isShowingAllDisplayModes)
+        #expect(context.connection.sentFrames.last == requestFrame("SM02"))
+        await context.receive(responseFrame(command: "sm", payload: "0200"))
+
+        #expect(context.viewModel.confirmedDisplayMode == 2)
+        #expect(context.viewModel.selectedPaletteMode == .mode2)
+        #expect(!context.viewModel.isShowingAllDisplayModes)
+        #expect(context.connection.sentFrames.dropFirst(enterStart).map(frameCommand) == ["SM", "SM"])
+    }
+
+    @MainActor
+    @Test func showAllModesLocksPaletteEditingAndBlocksSelectorSaveAndRestore() async throws {
+        let context = try await loadedPaletteContext()
+        context.viewModel.requestCurrentDisplayMode()
+        await context.receive(responseFrame(command: "rm", payload: "0200"))
+
+        var dirtyDraft = try #require(context.viewModel.paletteDrafts[.mode2])
+        dirtyDraft.roleValues[.date] = try RGB888(hex: "005CFF")
+        context.viewModel.updatePaletteDraft(dirtyDraft)
+
+        #expect(context.viewModel.canSelectPaletteMode)
+        #expect(context.viewModel.canEditSelectedPalette)
+        #expect(context.viewModel.canSaveSelectedPalette)
+        #expect(context.viewModel.canRestoreSelectedPaletteDefaults)
+
+        context.viewModel.userSetShowAllDisplayModes(true)
+        await context.receive(responseFrame(command: "sm", payload: "0400"))
+
+        #expect(context.viewModel.isPaletteEditingLockedByShowAllModes)
+        #expect(!context.viewModel.canSelectPaletteMode)
+        #expect(!context.viewModel.canEditSelectedPalette)
+        #expect(!context.viewModel.canSaveSelectedPalette)
+        #expect(!context.viewModel.canRestoreSelectedPaletteDefaults)
+        #expect(ColorPalettePresentation.showAllModesMessage == "Turn off Show all modes to edit colors.")
+
+        let lockedFrameCount = context.connection.sentFrames.count
+        context.viewModel.userSelectedPaletteMode(.mode3)
+        context.viewModel.requestPaletteSave(.mode2, draft: dirtyDraft)
+        context.viewModel.requestPaletteRestoreDefaults(.mode2)
+
+        #expect(context.viewModel.selectedPaletteMode == .mode2)
+        #expect(context.connection.sentFrames.count == lockedFrameCount)
+        #expect(context.connection.sentFrames.allSatisfy {
+            !["CP", "DP"].contains(frameCommand($0))
+        })
+    }
+
+    @MainActor
+    @Test func successfulShowAllModesReturnReenablesPaletteWithoutExtraSM() async throws {
+        let context = try await loadedPaletteContext()
+        context.viewModel.requestCurrentDisplayMode()
+        await context.receive(responseFrame(command: "rm", payload: "0200"))
+
+        var dirtyDraft = try #require(context.viewModel.paletteDrafts[.mode2])
+        dirtyDraft.roleValues[.date] = try RGB888(hex: "FF00FF")
+        context.viewModel.updatePaletteDraft(dirtyDraft)
+
+        context.viewModel.userSetShowAllDisplayModes(true)
+        await context.receive(responseFrame(command: "sm", payload: "0400"))
+        let returnStart = context.connection.sentFrames.count
+
+        context.viewModel.userSetShowAllDisplayModes(false)
+        #expect(context.viewModel.isPaletteEditingLockedByShowAllModes)
+        #expect(!context.viewModel.canSelectPaletteMode)
+        #expect(!context.viewModel.canEditSelectedPalette)
+        await context.receive(responseFrame(command: "sm", payload: "0200"))
+
+        #expect(!context.viewModel.isPaletteEditingLockedByShowAllModes)
+        #expect(context.viewModel.selectedPaletteMode == .mode2)
+        #expect(context.viewModel.canSelectPaletteMode)
+        #expect(context.viewModel.canEditSelectedPalette)
+        #expect(context.viewModel.canSaveSelectedPalette)
+        #expect(context.viewModel.canRestoreSelectedPaletteDefaults)
+        #expect(context.connection.sentFrames.dropFirst(returnStart).map(frameCommand) == ["SM"])
+        #expect(context.connection.sentFrames.last == requestFrame("SM02"))
+    }
+
+    @MainActor
+    @Test func directButtonsExitShowAllModesAndUnlockPaletteWithoutExtraSM() async throws {
+        let context = try await loadedPaletteContext()
+        context.viewModel.requestCurrentDisplayMode()
+        await context.receive(responseFrame(command: "rm", payload: "0300"))
+
+        for target in PaletteMode.editableCases {
+            context.viewModel.userSetShowAllDisplayModes(true)
+            await context.receive(responseFrame(command: "sm", payload: "0400"))
+            #expect(context.viewModel.isShowingAllDisplayModes)
+            #expect(context.viewModel.highlightedDisplayModes == Set(PaletteMode.editableCases))
+            #expect(context.viewModel.isPaletteEditingLockedByShowAllModes)
+
+            let exitStart = context.connection.sentFrames.count
+            context.viewModel.userSelectedDisplayMode(target)
+            #expect(context.viewModel.isShowingAllDisplayModes)
+            #expect(context.viewModel.isPaletteEditingLockedByShowAllModes)
+            #expect(context.connection.sentFrames.last == requestFrame("SM\(target.uppercaseHex)"))
+
+            await context.receive(responseFrame(command: "sm", payload: "\(target.uppercaseHex)00"))
+            #expect(!context.viewModel.isShowingAllDisplayModes)
+            #expect(context.viewModel.confirmedDisplayMode == target.rawValue)
+            #expect(context.viewModel.lastNormalDisplayMode == target)
+            #expect(context.viewModel.selectedPaletteMode == target)
+            #expect(context.viewModel.highlightedDisplayModes == [target])
+            #expect(!context.viewModel.isPaletteEditingLockedByShowAllModes)
+            #expect(context.viewModel.canSelectPaletteMode)
+            #expect(context.viewModel.canEditSelectedPalette)
+            #expect(context.connection.sentFrames.dropFirst(exitStart).map(frameCommand) == ["SM"])
+        }
+    }
+
+    @MainActor
+    @Test func failedDirectExitFromShowAllModesKeepsModeFourHighlightedAndConnected() async throws {
+        let context = try await loadedPaletteContext()
+        context.viewModel.requestCurrentDisplayMode()
+        await context.receive(responseFrame(command: "rm", payload: "0300"))
+        context.viewModel.userSetShowAllDisplayModes(true)
+        await context.receive(responseFrame(command: "sm", payload: "0400"))
+
+        context.viewModel.userSelectedDisplayMode(.mode1)
+        await context.receive(responseFrame(command: "sm", payload: "0104"))
+
+        #expect(context.viewModel.state == .connected)
+        #expect(context.viewModel.confirmedDisplayMode == PaletteMode.rotation.rawValue)
+        #expect(context.viewModel.lastNormalDisplayMode == .mode3)
+        #expect(context.viewModel.selectedPaletteMode == .mode3)
+        #expect(context.viewModel.isShowingAllDisplayModes)
+        #expect(context.viewModel.highlightedDisplayModes == Set(PaletteMode.editableCases))
+        #expect(context.viewModel.isPaletteEditingLockedByShowAllModes)
+    }
+
+    @MainActor
+    @Test func showAllModesFailuresRestoreBelievedPhysicalStateWithoutDisconnecting() async throws {
+        let context = try await loadedPaletteContext()
+        context.viewModel.requestCurrentDisplayMode()
+        await context.receive(responseFrame(command: "rm", payload: "0300"))
+
+        context.viewModel.userSetShowAllDisplayModes(true)
+        await context.receive(responseFrame(command: "sm", payload: "0404"))
+        #expect(context.viewModel.state == .connected)
+        #expect(context.viewModel.confirmedDisplayMode == 3)
+        #expect(!context.viewModel.isShowingAllDisplayModes)
+
+        context.viewModel.userSetShowAllDisplayModes(true)
+        await context.receive(responseFrame(command: "sm", payload: "0400"))
+        context.viewModel.userSetShowAllDisplayModes(false)
+        await context.receive(responseFrame(command: "sm", payload: "0304"))
+
+        #expect(context.viewModel.state == .connected)
+        #expect(context.viewModel.confirmedDisplayMode == 4)
+        #expect(context.viewModel.lastNormalDisplayMode == .mode3)
+        #expect(context.viewModel.isShowingAllDisplayModes)
+    }
+
+    @MainActor
+    @Test func rmUpdatesShowAllIndicatorStateWithoutSendingSM() async throws {
+        let context = try await loadedPaletteContext()
+
+        for mode in [PaletteMode.mode1, .mode2, .mode3] {
+            let startingCount = context.connection.sentFrames.count
+            context.viewModel.requestCurrentDisplayMode()
+            await context.receive(responseFrame(command: "rm", payload: "\(mode.uppercaseHex)00"))
+
+            #expect(context.viewModel.normalDisplayModeIndicatorMode == mode)
+            #expect(context.viewModel.highlightedDisplayModes == [mode])
+            #expect(context.viewModel.lastNormalDisplayMode == mode)
+            #expect(!context.viewModel.isShowingAllDisplayModes)
+            #expect(context.connection.sentFrames.dropFirst(startingCount).map(frameCommand) == ["RM"])
+        }
+
+        let lastNormalMode = context.viewModel.lastNormalDisplayMode
+        let startingCount = context.connection.sentFrames.count
+        context.viewModel.requestCurrentDisplayMode()
+        await context.receive(responseFrame(command: "rm", payload: "0400"))
+        #expect(context.viewModel.confirmedDisplayMode == 4)
+        #expect(context.viewModel.lastNormalDisplayMode == lastNormalMode)
+        #expect(context.viewModel.normalDisplayModeIndicatorMode == lastNormalMode)
+        #expect(context.viewModel.highlightedDisplayModes == Set(PaletteMode.editableCases))
+        #expect(context.viewModel.selectedPaletteMode == lastNormalMode)
+        #expect(context.viewModel.isShowingAllDisplayModes)
+        #expect(context.connection.sentFrames.dropFirst(startingCount).map(frameCommand) == ["RM"])
+    }
+
+    @MainActor
+    @Test func lastNormalDisplayModePersistsAndModeFourReturnsToItAfterRecreation() async throws {
+        let suiteName = "PaletteTests.LastNormalDisplayMode.\(UUID().uuidString)"
+        let userDefaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+        let firstContext = try await loadedPaletteContext(userDefaults: userDefaults)
+        firstContext.viewModel.requestCurrentDisplayMode()
+        await firstContext.receive(responseFrame(command: "rm", payload: "0200"))
+        #expect(firstContext.viewModel.lastNormalDisplayMode == .mode2)
+        #expect(userDefaults.integer(forKey: ESP32ControllerViewModel.lastNormalDisplayModeDefaultsKey) == 2)
+
+        let recreatedContext = try await loadedPaletteContext(userDefaults: userDefaults)
+        #expect(recreatedContext.viewModel.lastNormalDisplayMode == .mode2)
+        recreatedContext.viewModel.requestCurrentDisplayMode()
+        await recreatedContext.receive(responseFrame(command: "rm", payload: "0400"))
+        recreatedContext.viewModel.userSetShowAllDisplayModes(false)
+        #expect(recreatedContext.connection.sentFrames.last == requestFrame("SM02"))
+    }
+
+    @MainActor
+    @Test func modeFourWithoutStoredNormalModeReturnsToModeOne() async throws {
+        let suiteName = "PaletteTests.DefaultNormalDisplayMode.\(UUID().uuidString)"
+        let userDefaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { userDefaults.removePersistentDomain(forName: suiteName) }
+        userDefaults.removeObject(forKey: ESP32ControllerViewModel.lastNormalDisplayModeDefaultsKey)
+
+        let context = try await loadedPaletteContext(userDefaults: userDefaults)
+        #expect(context.viewModel.lastNormalDisplayMode == .mode1)
+        context.viewModel.requestCurrentDisplayMode()
+        await context.receive(responseFrame(command: "rm", payload: "0400"))
+        context.viewModel.userSetShowAllDisplayModes(false)
+
+        #expect(context.connection.sentFrames.last == requestFrame("SM01"))
+    }
+
+    @Test func clockControlsPresentationExposesDirectModeButtonsAndNoNextButton() {
+        #expect(ClockDisplayModePresentation.displayModeLabel == "Display mode")
+        #expect(ClockDisplayModePresentation.normalModes == [.mode1, .mode2, .mode3])
+        #expect(ClockDisplayModePresentation.normalModes.map {
+            ClockDisplayModePresentation.buttonLabel(for: $0)
+        } == ["1", "2", "3"])
+        #expect(ClockDisplayModePresentation.showAllModesLabel == "Show all modes")
+        #expect(!ClockDisplayModePresentation.showsNextDisplayModeButton)
+        #expect(!AlarmSectionPresentation.showsManualReadButton)
+    }
+
+    @MainActor
+    @Test func unknownDisplayModeHighlightsPersistedNormalModeOrModeOneFallback() async throws {
+        let fallbackSuite = "PaletteTests.HighlightFallback.\(UUID().uuidString)"
+        let fallbackDefaults = try #require(UserDefaults(suiteName: fallbackSuite))
+        defer { fallbackDefaults.removePersistentDomain(forName: fallbackSuite) }
+        fallbackDefaults.removeObject(forKey: ESP32ControllerViewModel.lastNormalDisplayModeDefaultsKey)
+
+        let fallbackContext = try await loadedPaletteContext(userDefaults: fallbackDefaults)
+        #expect(fallbackContext.viewModel.confirmedDisplayMode == nil)
+        #expect(fallbackContext.viewModel.highlightedDisplayModes == [.mode1])
+
+        let persistedSuite = "PaletteTests.HighlightPersisted.\(UUID().uuidString)"
+        let persistedDefaults = try #require(UserDefaults(suiteName: persistedSuite))
+        defer { persistedDefaults.removePersistentDomain(forName: persistedSuite) }
+        persistedDefaults.set(3, forKey: ESP32ControllerViewModel.lastNormalDisplayModeDefaultsKey)
+
+        let persistedContext = try await loadedPaletteContext(userDefaults: persistedDefaults)
+        #expect(persistedContext.viewModel.confirmedDisplayMode == nil)
+        #expect(persistedContext.viewModel.lastNormalDisplayMode == .mode3)
+        #expect(persistedContext.viewModel.highlightedDisplayModes == [.mode3])
     }
 
     @MainActor
@@ -1229,7 +1553,8 @@ private struct PaletteTestContext {
 private func connectedPaletteContext(
     recorder: PaletteFakeTCPConnectionRecorder = PaletteFakeTCPConnectionRecorder(),
     scheduler: PaletteFakeScheduler = PaletteFakeScheduler(),
-    automaticallyLoadsClockStateOnConnect: Bool = false
+    automaticallyLoadsClockStateOnConnect: Bool = false,
+    userDefaults: UserDefaults = .standard
 ) async throws -> PaletteTestContext {
     let client = ESP32TCPClient(
         connectionFactory: { _, _ in recorder.makeConnection() },
@@ -1241,7 +1566,8 @@ private func connectedPaletteContext(
         client: client,
         timeSyncScheduler: scheduler.schedule(_:_:),
         automaticallyReadsPalettesOnConnect: true,
-        automaticallyLoadsClockStateOnConnect: automaticallyLoadsClockStateOnConnect
+        automaticallyLoadsClockStateOnConnect: automaticallyLoadsClockStateOnConnect,
+        userDefaults: userDefaults
     )
     viewModel.authorizeNetworking()
     viewModel.manualBoardID = "0"
@@ -1289,9 +1615,14 @@ private func automaticAlarmLoadedContext(
 @MainActor
 private func loadedPaletteContext(
     recorder: PaletteFakeTCPConnectionRecorder = PaletteFakeTCPConnectionRecorder(),
-    scheduler: PaletteFakeScheduler = PaletteFakeScheduler()
+    scheduler: PaletteFakeScheduler = PaletteFakeScheduler(),
+    userDefaults: UserDefaults = .standard
 ) async throws -> PaletteTestContext {
-    let context = try await connectedPaletteContext(recorder: recorder, scheduler: scheduler)
+    let context = try await connectedPaletteContext(
+        recorder: recorder,
+        scheduler: scheduler,
+        userDefaults: userDefaults
+    )
     for mode in PaletteMode.editableCases {
         await context.receive(factoryLPResponse(mode: mode))
     }

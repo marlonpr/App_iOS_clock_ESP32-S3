@@ -2554,7 +2554,7 @@ struct ESP32ControllerTests {
         let recorder = FakeTCPConnectionRecorder()
         let viewModel = makeViewModelForConnectionIndicatorTests(recorder: recorder)
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
 
         #expect(recorder.connections.isEmpty)
         #expect(viewModel.displayModeChangeState == .failed("Connect to a CLOCK before sending clock commands."))
@@ -2565,7 +2565,7 @@ struct ESP32ControllerTests {
         let recorder = FakeTCPConnectionRecorder()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: " ")
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
 
         #expect(recorder.connections[0].sendCallCount == 0)
         #expect(viewModel.displayModeChangeState == .failed(ClockProtocolEncodingError.missingBoardID.localizedDescription))
@@ -2582,7 +2582,7 @@ struct ESP32ControllerTests {
         recorder.connections[0].stateUpdateHandler?(.ready)
         await drainMainQueue()
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
 
         #expect(recorder.connections[0].sendCallCount == 0)
         #expect(viewModel.displayModeChangeState == .failed(ClockProtocolEncodingError.missingBoardID.localizedDescription))
@@ -2594,7 +2594,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
 
         let connection = recorder.connections[0]
         #expect(connection.sendCallCount == 1)
@@ -2622,7 +2622,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[0].lastSendCompletion?(nil)
         await drainMainQueue()
 
@@ -2637,7 +2637,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[0].lastSendCompletion?(NWError.posix(.ECONNRESET))
         await drainMainQueue()
 
@@ -2645,6 +2645,9 @@ struct ESP32ControllerTests {
         #expect(viewModel.displayModeChangeState == .failed("Unable to send display mode command"))
         #expect(viewModel.commandStatusMessage == "Unable to send display mode command")
         #expect(!viewModel.isDisplayModeSuccessAlertPresented)
+        #expect(recorder.connections[0].sentContents.compactMap { $0.map(Array.init) } == [
+            expectedNMFrame(boardID: 0)
+        ])
     }
 
     @MainActor
@@ -2653,7 +2656,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[0].lastSendCompletion?(nil)
         await drainMainQueue()
         let receive = try #require(recorder.connections[0].lastReceiveCompletion)
@@ -2677,7 +2680,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[0].lastSendCompletion?(nil)
         await drainMainQueue()
         let receive = try #require(recorder.connections[0].lastReceiveCompletion)
@@ -2696,7 +2699,7 @@ struct ESP32ControllerTests {
             let scheduler = FakeHeartbeatScheduler()
             let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-            viewModel.requestNextDisplayMode()
+            viewModel.requestFirmwareNextDisplayMode()
             recorder.connections[0].lastSendCompletion?(nil)
             await drainMainQueue()
             let receive = try #require(recorder.connections[0].lastReceiveCompletion)
@@ -2716,7 +2719,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[0].lastSendCompletion?(nil)
         await drainMainQueue()
         let response = expectedNMResponse(boardID: 1, mode: 1)
@@ -2735,7 +2738,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[0].lastSendCompletion?(nil)
         await drainMainQueue()
         let malformedResponse: [UInt8] = [0x2F, 0x74, 0x61, 0x00, 0x6E, 0x6D, 0x01, 0x02, 0x5C]
@@ -2754,7 +2757,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[0].lastSendCompletion?(nil)
         await drainMainQueue()
         let unrelatedResponse = expectedUCAcknowledgement(boardID: 0)
@@ -2773,7 +2776,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         let receive = try #require(recorder.connections[0].lastReceiveCompletion)
         receive(Data(expectedNMResponse(boardID: 0, mode: 2)), nil, false, nil)
         await drainMainQueue()
@@ -2790,11 +2793,12 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
+        let nextModeSendCompletion = try #require(recorder.connections[0].lastSendCompletion)
         let receive = try #require(recorder.connections[0].lastReceiveCompletion)
         receive(Data(expectedNMResponse(boardID: 0, mode: 2)), nil, false, nil)
         await drainMainQueue()
-        recorder.connections[0].lastSendCompletion?(nil)
+        nextModeSendCompletion(nil)
         await drainMainQueue()
 
         #expect(viewModel.displayModeChangeState == .succeeded(mode: 2))
@@ -2808,7 +2812,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         let receive = try #require(recorder.connections[0].lastReceiveCompletion)
         receive(Data(expectedNMResponse(boardID: 0, mode: 3)), nil, false, nil)
         await drainMainQueue()
@@ -2835,14 +2839,14 @@ struct ESP32ControllerTests {
         await drainMainQueue()
         recorder.connections[0].stateUpdateHandler?(.ready)
         await drainMainQueue()
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         let staleReceive = try #require(recorder.connections[0].lastReceiveCompletion)
 
         viewModel.connect()
         await drainMainQueue()
         recorder.connections[1].stateUpdateHandler?(.ready)
         await drainMainQueue()
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[1].lastSendCompletion?(nil)
         await drainMainQueue()
 
@@ -2852,6 +2856,9 @@ struct ESP32ControllerTests {
         #expect(viewModel.displayModeChangeState == .waitingForConfirmation)
         #expect(!viewModel.isDisplayModeSuccessAlertPresented)
         #expect(viewModel.confirmedDisplayMode == nil)
+        #expect(recorder.connections[1].sentContents.compactMap { $0.map(Array.init) } == [
+            expectedNMFrame(boardID: 0)
+        ])
     }
 
     @MainActor
@@ -2860,7 +2867,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[0].lastSendCompletion?(nil)
         await drainMainQueue()
         scheduler.tasks[0].fire()
@@ -2877,7 +2884,7 @@ struct ESP32ControllerTests {
         let scheduler = FakeHeartbeatScheduler()
         let viewModel = try await connectedViewModel(recorder: recorder, boardID: "0", timeSyncScheduler: scheduler.schedule(_:_:))
 
-        viewModel.requestNextDisplayMode()
+        viewModel.requestFirmwareNextDisplayMode()
         recorder.connections[0].lastSendCompletion?(nil)
         await drainMainQueue()
 

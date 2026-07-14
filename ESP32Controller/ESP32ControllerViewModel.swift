@@ -50,6 +50,8 @@ final class ESP32ControllerViewModel: ObservableObject {
     @Published private(set) var isTimeSyncSuccessAlertPresented = false
     @Published private(set) var displayModeChangeState: DisplayModeChangeState = .idle
     @Published private(set) var confirmedDisplayMode: UInt8?
+    @Published private(set) var lastNormalDisplayMode: PaletteMode = .mode1
+    @Published private(set) var isShowingAllDisplayModes = false
     @Published private(set) var isDisplayModeSuccessAlertPresented = false
     @Published private(set) var setDisplayModeState: SetDisplayModeState = .idle
     @Published private(set) var readDisplayModeState: ReadDisplayModeState = .idle
@@ -124,6 +126,7 @@ final class ESP32ControllerViewModel: ObservableObject {
     private let automaticallyLoadsClockStateOnConnect: Bool
     private let maxLogEntries = 200
     nonisolated static let lastConnectedDeviceDefaultsKey = "ESP32Controller.LastConnectedDevice.v1"
+    nonisolated static let lastNormalDisplayModeDefaultsKey = "ESP32Controller.LastNormalDisplayMode.v1"
     private var pendingConnectionEndpointDescription: String?
     private var pendingConnectionDevice: DiscoveredESP32?
     private var pendingManualHost: String?
@@ -171,6 +174,7 @@ final class ESP32ControllerViewModel: ObservableObject {
     private var pendingSetDisplayModeTarget: PaletteMode?
     private var setDisplayModeConfirmationTimeoutTask: CancellableTask?
     private var pendingReadDisplayModeOperation: PendingReadDisplayModeOperation?
+    private var deferredReadDisplayModeRefreshConnectionGeneration: UUID?
     private var readDisplayModeTimeoutTask: CancellableTask?
     private var pendingDefaultLogoRestoreOperationID: UUID?
     private var pendingDefaultLogoRestoreConnectionGeneration: UUID?
@@ -257,8 +261,38 @@ final class ESP32ControllerViewModel: ObservableObject {
         canUseClockControls && !timeSyncState.isConfirmationPending
     }
 
-    var canRequestNextDisplayMode: Bool {
-        canUseClockControls && !displayModeChangeState.isConfirmationPending
+    var canSelectDisplayMode: Bool {
+        canUseClockControls &&
+            !setDisplayModeState.isPending &&
+            !displayModeChangeState.isConfirmationPending &&
+            !isPaletteOperationPending
+    }
+
+    var canToggleShowAllDisplayModes: Bool {
+        canUseClockControls &&
+            !setDisplayModeState.isPending &&
+            !displayModeChangeState.isConfirmationPending &&
+            !isPaletteOperationPending
+    }
+
+    var normalDisplayModeIndicatorMode: PaletteMode {
+        guard
+            let confirmedDisplayMode,
+            let confirmedMode = PaletteMode(rawValue: confirmedDisplayMode),
+            confirmedMode.isEditable
+        else {
+            return lastNormalDisplayMode
+        }
+
+        return confirmedMode
+    }
+
+    var highlightedDisplayModes: Set<PaletteMode> {
+        if isShowingAllDisplayModes || confirmedDisplayMode == PaletteMode.rotation.rawValue {
+            return Set(PaletteMode.editableCases)
+        }
+
+        return [normalDisplayModeIndicatorMode]
     }
 
     var canUploadLogo: Bool {
@@ -311,8 +345,17 @@ final class ESP32ControllerViewModel: ObservableObject {
         paletteReadState.isReading || paletteSaveState.isSaving || paletteDefaultRestoreState.isRestoring
     }
 
+    var isPaletteEditingLockedByShowAllModes: Bool {
+        isShowingAllDisplayModes || confirmedDisplayMode == PaletteMode.rotation.rawValue
+    }
+
+    var canSelectPaletteMode: Bool {
+        !isPaletteEditingLockedByShowAllModes && !isPaletteOperationPending
+    }
+
     var canEditSelectedPalette: Bool {
-        canUseClockControls &&
+        !isPaletteEditingLockedByShowAllModes &&
+            canUseClockControls &&
             paletteFeatureAvailability.isAvailable &&
             paletteRecords[selectedPaletteMode] != nil &&
             paletteDrafts[selectedPaletteMode] != nil &&
@@ -543,6 +586,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         self.automaticallyLoadsClockStateOnConnect = automaticallyLoadsClockStateOnConnect
         self.userDefaults = userDefaults
         self.lastConnectedDevice = Self.loadLastConnectedDevice(from: userDefaults)
+        self.lastNormalDisplayMode = Self.loadLastNormalDisplayMode(from: userDefaults)
 
         self.client.onStateChange = { [weak self] state in
             DispatchQueue.main.async {
@@ -1341,6 +1385,65 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func requestNextDisplayMode() {
+        guard canSelectDisplayMode, !isShowingAllDisplayModes else {
+            return
+        }
+
+        let currentNormalMode: PaletteMode
+        if let confirmedDisplayMode,
+           let confirmedMode = PaletteMode(rawValue: confirmedDisplayMode),
+           confirmedMode.isEditable {
+            currentNormalMode = confirmedMode
+        } else {
+            currentNormalMode = lastNormalDisplayMode
+        }
+
+        let nextMode: PaletteMode = switch currentNormalMode {
+        case .mode1:
+            .mode2
+        case .mode2:
+            .mode3
+        case .mode3, .rotation:
+            .mode1
+        }
+
+        requestSetDisplayMode(nextMode)
+    }
+
+    func userSelectedDisplayMode(_ mode: PaletteMode) {
+        guard mode.isEditable, canSelectDisplayMode else {
+            return
+        }
+        guard isShowingAllDisplayModes || confirmedDisplayMode != mode.rawValue else {
+            return
+        }
+
+        requestSetDisplayMode(mode)
+    }
+
+    func userSetShowAllDisplayModes(_ showAllModes: Bool) {
+        guard showAllModes != isShowingAllDisplayModes else {
+            return
+        }
+        guard canToggleShowAllDisplayModes else {
+            return
+        }
+
+        if showAllModes {
+            if let confirmedDisplayMode,
+               let confirmedMode = PaletteMode(rawValue: confirmedDisplayMode),
+               confirmedMode.isEditable {
+                updateLastNormalDisplayMode(confirmedMode)
+            }
+            isShowingAllDisplayModes = true
+            requestSetDisplayMode(.rotation)
+        } else {
+            isShowingAllDisplayModes = false
+            requestSetDisplayMode(lastNormalDisplayMode)
+        }
+    }
+
+    func requestFirmwareNextDisplayMode() {
         guard isNetworkingAuthorized else {
             return
         }
@@ -1408,7 +1511,11 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func userSelectedPaletteMode(_ mode: PaletteMode) {
-        guard mode.isEditable, mode != selectedPaletteMode else {
+        guard
+            !isPaletteEditingLockedByShowAllModes,
+            mode.isEditable,
+            mode != selectedPaletteMode
+        else {
             return
         }
 
@@ -1467,6 +1574,7 @@ final class ESP32ControllerViewModel: ObservableObject {
                         self.clearPendingSetDisplayModeOperation()
                         let message = "Unable to send Set Mode command."
                         self.setDisplayModeState = .failed(mode: mode, message: message)
+                        self.reconcileShowAllDisplayModesWithConfirmedMode()
                         self.commandStatusMessage = message
                         self.appendEvent("\(message) \(error.localizedDescription)")
                     } else {
@@ -1488,6 +1596,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         } catch {
             clearPendingSetDisplayModeOperation()
             setDisplayModeState = .failed(mode: mode, message: error.localizedDescription)
+            reconcileShowAllDisplayModesWithConfirmedMode()
             commandStatusMessage = error.localizedDescription
             appendEvent(error.localizedDescription)
         }
@@ -1774,7 +1883,7 @@ final class ESP32ControllerViewModel: ObservableObject {
     }
 
     func updatePaletteDraft(_ draft: ModePaletteDraft) {
-        guard draft.mode.isEditable else {
+        guard !isPaletteEditingLockedByShowAllModes, draft.mode.isEditable else {
             return
         }
         paletteDrafts[draft.mode] = draft
@@ -1795,6 +1904,7 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     func canSavePalette(mode: PaletteMode) -> Bool {
         guard
+            !isPaletteEditingLockedByShowAllModes,
             canUseClockControls,
             paletteFeatureAvailability.isAvailable,
             pendingPaletteOperation == nil,
@@ -1830,6 +1940,9 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     func requestPaletteSave(_ mode: PaletteMode, draft: ModePaletteDraft) {
         guard isNetworkingAuthorized else {
+            return
+        }
+        guard !isPaletteEditingLockedByShowAllModes else {
             return
         }
 
@@ -1874,6 +1987,9 @@ final class ESP32ControllerViewModel: ObservableObject {
 
     func requestPaletteRestoreDefaults(_ mode: PaletteMode) {
         guard isNetworkingAuthorized else {
+            return
+        }
+        guard !isPaletteEditingLockedByShowAllModes else {
             return
         }
         guard mode.isEditable else {
@@ -2822,13 +2938,13 @@ final class ESP32ControllerViewModel: ObservableObject {
 
             cancelReadDisplayModeTimeout()
             pendingReadDisplayModeOperation = nil
-            confirmedDisplayMode = mode.rawValue
+            applyConfirmedDisplayMode(mode)
             readDisplayModeState = .loaded(mode: mode.rawValue)
-            if mode.isEditable {
-                selectedPaletteMode = mode
-            }
             commandStatusMessage = "Display mode loaded."
             appendLog(direction: .incoming, bytes: bytes, message: "RM Display Mode \(mode.rawValue) Loaded")
+            if startDeferredReadDisplayModeRefreshIfNeeded(after: operation) {
+                return true
+            }
             if operation.isAutomatic {
                 continueAutomaticStartupLoadAfterDisplayModeIfNeeded(
                     connectionGeneration: operation.connectionGeneration
@@ -2893,6 +3009,9 @@ final class ESP32ControllerViewModel: ObservableObject {
         readDisplayModeState = .failed(failureMessage)
         commandStatusMessage = failureMessage
         appendEvent(failureMessage)
+        if startDeferredReadDisplayModeRefreshIfNeeded(after: operation) {
+            return
+        }
         if operation.isAutomatic {
             continueAutomaticStartupLoadAfterDisplayModeIfNeeded(
                 connectionGeneration: operation.connectionGeneration
@@ -2903,6 +3022,38 @@ final class ESP32ControllerViewModel: ObservableObject {
     private func cancelReadDisplayModeTimeout() {
         readDisplayModeTimeoutTask?.cancel()
         readDisplayModeTimeoutTask = nil
+    }
+
+    private func refreshDisplayModeAfterNextModeSuccess(connectionGeneration: UUID) {
+        guard
+            activeConnectionGeneration == connectionGeneration,
+            state == .connected,
+            isNetworkingAuthorized
+        else {
+            return
+        }
+
+        guard pendingReadDisplayModeOperation == nil else {
+            deferredReadDisplayModeRefreshConnectionGeneration = connectionGeneration
+            return
+        }
+
+        beginReadDisplayMode(isAutomatic: false)
+    }
+
+    private func startDeferredReadDisplayModeRefreshIfNeeded(
+        after operation: PendingReadDisplayModeOperation
+    ) -> Bool {
+        guard deferredReadDisplayModeRefreshConnectionGeneration == operation.connectionGeneration else {
+            if deferredReadDisplayModeRefreshConnectionGeneration != activeConnectionGeneration {
+                deferredReadDisplayModeRefreshConnectionGeneration = nil
+            }
+            return false
+        }
+
+        deferredReadDisplayModeRefreshConnectionGeneration = nil
+        beginReadDisplayMode(isAutomatic: operation.isAutomatic)
+        return true
     }
 
     private func beginClockConfigurationRead(isAutomatic: Bool) {
@@ -3146,7 +3297,8 @@ final class ESP32ControllerViewModel: ObservableObject {
         guard
             displayModeChangeState == .sending || displayModeChangeState == .waitingForConfirmation,
             pendingDisplayModeOperationID != nil,
-            pendingDisplayModeConnectionGeneration == activeConnectionGeneration,
+            let connectionGeneration = pendingDisplayModeConnectionGeneration,
+            connectionGeneration == activeConnectionGeneration,
             let boardID = connectedProtocolBoardID,
             let mode = Self.displayModeResponseMode(bytes, boardID: boardID)
         else {
@@ -3156,11 +3308,14 @@ final class ESP32ControllerViewModel: ObservableObject {
         cancelDisplayModeConfirmationTimeout()
         pendingDisplayModeOperationID = nil
         pendingDisplayModeConnectionGeneration = nil
-        confirmedDisplayMode = mode
+        if let confirmedMode = PaletteMode(rawValue: mode) {
+            applyConfirmedDisplayMode(confirmedMode)
+        }
         displayModeChangeState = .succeeded(mode: mode)
         isDisplayModeSuccessAlertPresented = true
         commandStatusMessage = "Display mode changed to Mode \(mode)"
         appendLog(direction: .incoming, bytes: bytes, message: "NM Display Mode Confirmed")
+        refreshDisplayModeAfterNextModeSuccess(connectionGeneration: connectionGeneration)
         return true
     }
 
@@ -3201,6 +3356,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             clearPendingSetDisplayModeOperation()
             let message = "Could not change display mode. \(error.localizedDescription)"
             setDisplayModeState = .failed(mode: target, message: message)
+            reconcileShowAllDisplayModesWithConfirmedMode()
             commandStatusMessage = message
             appendLog(direction: .incoming, bytes: bytes, message: "SM Set Display Mode Invalid Response")
             return true
@@ -3216,6 +3372,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         guard acknowledgement.modeValue == target.rawValue else {
             let message = "Could not change display mode. The CLOCK confirmed a different mode."
             setDisplayModeState = .failed(mode: target, message: message)
+            reconcileShowAllDisplayModesWithConfirmedMode()
             commandStatusMessage = message
             appendLog(direction: .incoming, bytes: bytes, message: "SM Set Display Mode Mismatched Response")
             return true
@@ -3224,6 +3381,7 @@ final class ESP32ControllerViewModel: ObservableObject {
         guard acknowledgement.status == .success else {
             let message = "Could not change display mode. \(acknowledgement.status.message)"
             setDisplayModeState = .failed(mode: target, message: message)
+            reconcileShowAllDisplayModesWithConfirmedMode()
             commandStatusMessage = message
             appendLog(
                 direction: .incoming,
@@ -3233,7 +3391,7 @@ final class ESP32ControllerViewModel: ObservableObject {
             return true
         }
 
-        confirmedDisplayMode = target.rawValue
+        applyConfirmedDisplayMode(target)
         setDisplayModeState = .succeeded(mode: target)
         commandStatusMessage = "Display mode changed to Mode \(target.rawValue)"
         appendLog(direction: .incoming, bytes: bytes, message: "SM Set Display Mode Confirmed")
@@ -3399,6 +3557,7 @@ final class ESP32ControllerViewModel: ObservableObject {
                 self.clearPendingSetDisplayModeOperation()
                 let message = "Display mode change not confirmed."
                 self.setDisplayModeState = .failed(mode: mode, message: message)
+                self.reconcileShowAllDisplayModesWithConfirmedMode()
                 self.commandStatusMessage = message
                 self.appendEvent(message)
             }
@@ -3421,6 +3580,31 @@ final class ESP32ControllerViewModel: ObservableObject {
         cancelSetDisplayModeConfirmationTimeout()
         clearPendingSetDisplayModeOperation()
         setDisplayModeState = .idle
+    }
+
+    private func applyConfirmedDisplayMode(_ mode: PaletteMode) {
+        confirmedDisplayMode = mode.rawValue
+
+        if mode.isEditable {
+            updateLastNormalDisplayMode(mode)
+            isShowingAllDisplayModes = false
+            selectedPaletteMode = mode
+        } else {
+            isShowingAllDisplayModes = true
+        }
+    }
+
+    private func updateLastNormalDisplayMode(_ mode: PaletteMode) {
+        guard mode.isEditable else {
+            return
+        }
+
+        lastNormalDisplayMode = mode
+        userDefaults.set(Int(mode.rawValue), forKey: Self.lastNormalDisplayModeDefaultsKey)
+    }
+
+    private func reconcileShowAllDisplayModesWithConfirmedMode() {
+        isShowingAllDisplayModes = confirmedDisplayMode == PaletteMode.rotation.rawValue
     }
 
     private func scheduleDefaultLogoRestoreConfirmationTimeout(operationID: UUID, connectionGeneration: UUID?) {
@@ -4005,10 +4189,12 @@ final class ESP32ControllerViewModel: ObservableObject {
         cancelDisplayModeTasks()
         cancelReadDisplayModeTimeout()
         pendingReadDisplayModeOperation = nil
+        deferredReadDisplayModeRefreshConnectionGeneration = nil
         pendingDisplayModeOperationID = nil
         pendingDisplayModeConnectionGeneration = nil
         isDisplayModeSuccessAlertPresented = false
         confirmedDisplayMode = nil
+        isShowingAllDisplayModes = false
         displayModeChangeState = .idle
         readDisplayModeState = .idle
         clearSetDisplayModeStateForConnectionChange()
@@ -4979,6 +5165,15 @@ final class ESP32ControllerViewModel: ObservableObject {
         }
 
         userDefaults.set(data, forKey: lastConnectedDeviceDefaultsKey)
+    }
+
+    private static func loadLastNormalDisplayMode(from userDefaults: UserDefaults) -> PaletteMode {
+        let rawValue = UInt8(clamping: userDefaults.integer(forKey: lastNormalDisplayModeDefaultsKey))
+        guard let mode = PaletteMode(rawValue: rawValue), mode.isEditable else {
+            return .mode1
+        }
+
+        return mode
     }
 
     private func appendLog(

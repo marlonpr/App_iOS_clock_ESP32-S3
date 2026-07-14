@@ -38,6 +38,17 @@ enum MainControlBottomAction: Equatable {
     }
 }
 
+enum ClockDisplayModePresentation {
+    static let displayModeLabel = "Display mode"
+    static let normalModes = PaletteMode.editableCases
+    static let showAllModesLabel = "Show all modes"
+    static let showsNextDisplayModeButton = false
+
+    static func buttonLabel(for mode: PaletteMode) -> String {
+        String(mode.rawValue)
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var viewModel: ESP32ControllerViewModel
 #if LOGIN_ENABLED
@@ -149,14 +160,27 @@ struct ContentView: View {
             .accessibilityValue(viewModel.timeSyncState.isConfirmationPending ? "Synchronizing" : "")
             .disabled(!viewModel.canSyncTime)
 
-            Button("Next Display Mode") {
-                dismissKeyboard()
-                viewModel.requestNextDisplayMode()
+            VStack(alignment: .leading, spacing: 8) {
+                Text(ClockDisplayModePresentation.displayModeLabel)
+
+                HStack(spacing: 6) {
+                    ForEach(ClockDisplayModePresentation.normalModes, id: \.self) { mode in
+                        displayModeButton(mode)
+                    }
+                }
             }
-            .accessibilityLabel("Next Display Mode")
-            .accessibilityHint("Advances the CLOCK display to the next mode.")
-            .accessibilityValue(viewModel.displayModeChangeState.isConfirmationPending ? "Changing" : "")
-            .disabled(!viewModel.canRequestNextDisplayMode)
+
+            Toggle(
+                ClockDisplayModePresentation.showAllModesLabel,
+                isOn: Binding(
+                    get: { viewModel.isShowingAllDisplayModes },
+                    set: { showAllModes in
+                        dismissKeyboard()
+                        viewModel.userSetShowAllDisplayModes(showAllModes)
+                    }
+                )
+            )
+            .disabled(!viewModel.canToggleShowAllDisplayModes)
 
             Picker("Time Format", selection: Binding(
                 get: { viewModel.is24HourFormat },
@@ -212,6 +236,33 @@ struct ContentView: View {
             }
 
         }
+    }
+
+    private func displayModeButton(_ mode: PaletteMode) -> some View {
+        let isHighlighted = viewModel.highlightedDisplayModes.contains(mode)
+
+        return Button {
+            dismissKeyboard()
+            viewModel.userSelectedDisplayMode(mode)
+        } label: {
+            Text(ClockDisplayModePresentation.buttonLabel(for: mode))
+                .font(.body.monospacedDigit().weight(isHighlighted ? .semibold : .regular))
+                .foregroundStyle(isHighlighted ? Color.white : Color.accentColor)
+                .frame(maxWidth: .infinity, minHeight: 36)
+                .background {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(
+                            isHighlighted
+                                ? Color.accentColor
+                                : Color.secondary.opacity(0.10)
+                        )
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Display mode \(mode.rawValue)")
+        .accessibilityHint("Sets the CLOCK to display mode \(mode.rawValue).")
+        .accessibilityValue(isHighlighted ? "Active" : "")
+        .disabled(!viewModel.canSelectDisplayMode)
     }
 
     private var alarmSection: some View {
